@@ -76,7 +76,7 @@ app.get('/:fileId', async (req, res) => {
                             // এই লাইনটি আসল নামে ডাউনলোড নিশ্চিত করবে
                             ContentDisposition: `attachment; filename="${fileName}"`
                         },
-                        queueSize: 4,
+                        queueSize: 1,
                         partSize: 1024 * 1024 * 10
                     });
 
