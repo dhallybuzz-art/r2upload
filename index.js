@@ -22,52 +22,64 @@ app.get('/favicon.ico', (req, res) => res.status(204).end());
 
 app.get('/:fileId', async (req, res) => {
     const fileId = req.params.fileId;
-    if (!fileId || fileId.length < 15) return res.status(400).json({ status: "error", message: "Invalid ID" });
+    if (!fileId || fileId.length < 15) {
+        return res.status(400).json({ status: "error", message: "Invalid ID" });
+    }
 
-    const r2KeyForStorage = `${fileId}.mp4`; 
+    const r2KeyForStorage = `${fileId}.mp4`;
     const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${r2KeyForStorage}`;
 
     try {
-        // ১. ফাইলের মেটাডাটা সংগ্রহ
+        // ১. Google Drive Metadata
         const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size&key=${process.env.GDRIVE_API_KEY}`;
-        let fileName = `Movie_${fileId}`; 
+        let fileName = `Movie_${fileId}`;
         let fileSize = 0;
 
         try {
             const metaResponse = await axios.get(metaUrl);
-            fileName = metaResponse.data.name; 
+            fileName = metaResponse.data.name || fileName;
             fileSize = parseInt(metaResponse.data.size) || 0;
         } catch (e) {
-            console.error("Metadata Fetch Failed - Check API Key or File Privacy");
+            console.error("Metadata Fetch Failed");
         }
 
-        // ২. R2 চেক (যদি আগে আপলোড হয়ে থাকে)
+        // ২. R2 Check
         try {
             const headData = await s3Client.send(new HeadObjectCommand({
                 Bucket: process.env.R2_BUCKET_NAME,
                 Key: r2KeyForStorage
             }));
-            
+
+            const originalNameFromMeta =
+                headData.Metadata?.originalname || fileName;
+
             return res.json({
                 status: "success",
-                filename: fileName,
+                filename: originalNameFromMeta,
                 size: headData.ContentLength || fileSize,
                 url: r2PublicUrl,
-                r2_key: fileName 
+                r2_key: originalNameFromMeta
             });
-        } catch (e) {}
 
-        // ৩. ব্যাকগ্রাউন্ড আপলোড লজিক
+        } catch (e) {
+            // Not found in R2 → upload শুরু হবে
+        }
+
+        // ৩. Background Upload
         if (!activeUploads.has(fileId)) {
             const startUpload = async () => {
                 activeUploads.add(fileId);
                 console.log(`Starting background upload: ${fileName}`);
-                
+
                 try {
                     const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
-                    
-                    // ৪MD এরর এড়াতে সরাসরি স্ট্রীম ব্যবহার
-                    const response = await axios({ method: 'get', url: gDriveUrl, responseType: 'stream', timeout: 0 });
+
+                    const response = await axios({
+                        method: 'get',
+                        url: gDriveUrl,
+                        responseType: 'stream',
+                        timeout: 0
+                    });
 
                     const upload = new Upload({
                         client: s3Client,
@@ -75,24 +87,29 @@ app.get('/:fileId', async (req, res) => {
                             Bucket: process.env.R2_BUCKET_NAME,
                             Key: r2KeyForStorage,
                             Body: response.data.pipe(new stream.PassThrough()),
-                            ContentType: response.headers['content-type'] || 'video/mp4'
+                            ContentType: response.headers['content-type'] || 'video/mp4',
+                            Metadata: {
+                                originalname: fileName
+                            }
                         },
-                        queueSize: 4, // স্পিড বাড়াবে
-                        partSize: 1024 * 1024 * 10 // ১০ মেগাবাইট চাঙ্ক (মেমোরি সাশ্রয়ী)
+                        queueSize: 4,
+                        partSize: 1024 * 1024 * 10
                     });
 
                     await upload.done();
                     console.log(`Successfully uploaded: ${fileName}`);
+
                 } catch (err) {
-                    console.error(`Upload error (Check 403 Forbidden):`, err.message);
+                    console.error(`Upload error:`, err.message);
                 } finally {
                     activeUploads.delete(fileId);
                 }
             };
+
             startUpload();
         }
 
-        res.json({
+        return res.json({
             status: "processing",
             filename: fileName,
             message: "Initialization successful. Processing in background.",
@@ -100,7 +117,7 @@ app.get('/:fileId', async (req, res) => {
         });
 
     } catch (error) {
-        res.json({ status: "processing", message: "Retrying..." });
+        return res.json({ status: "processing", message: "Retrying..." });
     }
 });
 
