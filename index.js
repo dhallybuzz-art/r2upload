@@ -28,24 +28,24 @@ app.get('/:fileId', async (req, res) => {
         return res.status(400).json({ status: "error", message: "Invalid File ID" });
     }
 
-    // ১. Google Drive Metadata সংগ্রহ (আসল নাম ও সাইজ)
-    const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size&key=${process.env.GDRIVE_API_KEY}`;
-    let fileName = `Movie_${fileId}`; 
-    let fileSize = 0;
-
     try {
-        const metaResponse = await axios.get(metaUrl);
-        fileName = metaResponse.data.name; 
-        fileSize = parseInt(metaResponse.data.size) || 0;
-    } catch (e) {
-        console.error("Meta Fetch Error:", e.message);
-    }
+        // ১. Google Drive Metadata সংগ্রহ (আসল নাম ও সাইজ)
+        const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size&key=${process.env.GDRIVE_API_KEY}`;
+        let fileName = `Movie_${fileId}`; 
+        let fileSize = 0;
 
-    // ২. R2 বাকেট কি (Key) - স্টোরেজের জন্য আইডি ব্যবহার করাই সবচেয়ে নিরাপদ
-    const r2KeyForStorage = `${fileId}.mp4`; 
-    const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${r2KeyForStorage}`;
+        try {
+            const metaResponse = await axios.get(metaUrl);
+            fileName = metaResponse.data.name; 
+            fileSize = parseInt(metaResponse.data.size) || 0;
+        } catch (e) {
+            console.error("Meta Fetch Error:", e.message);
+        }
 
-    try {
+        // ২. বাকেট Key নির্ধারণ (বাকেটে সেভ হবে ID নামে, কিন্তু রেসপন্সে যাবে আসল নাম)
+        const r2KeyForStorage = `${fileId}.mp4`; 
+        const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${r2KeyForStorage}`;
+
         // ৩. R2 বাকেটে ফাইল আছে কি না চেক
         try {
             const headData = await s3Client.send(new HeadObjectCommand({
@@ -59,7 +59,7 @@ app.get('/:fileId', async (req, res) => {
                 filename: fileName,
                 size: headData.ContentLength || fileSize,
                 url: r2PublicUrl,
-                r2_key: fileName // এখানে আপনার চাহিদা মতো অরিজিনাল ফাইল নেম দেওয়া হয়েছে
+                r2_key: fileName 
             });
         } catch (e) {
             // ফাইল নেই
@@ -88,12 +88,12 @@ app.get('/:fileId', async (req, res) => {
                     client: s3Client,
                     params: {
                         Bucket: process.env.R2_BUCKET_NAME,
-                        Key: r2KeyForStorage,
+                        Key: r2KeyForStorage, // বাকেটে আইডি দিয়ে সেভ হবে
                         Body: response.data.pipe(new stream.PassThrough()),
                         ContentType: response.headers['content-type'] || 'video/mp4'
                     },
                     queueSize: 4,
-                    partSize: 1024 * 1024 * 10 // 10MB চাঙ্ক স্পিড বাড়ানোর জন্য
+                    partSize: 1024 * 1024 * 10 // 10MB চাঙ্ক
                 });
 
                 await upload.done();
