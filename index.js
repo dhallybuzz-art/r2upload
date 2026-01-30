@@ -1,8 +1,8 @@
 const express = require('express');
 const axios = require('axios');
-const { S3Client } = require('@aws-sdk/client-s3');
+const { S3Client, HeadObjectCommand } = require('@aws-sdk/client-s3');
 const { Upload } = require('@aws-sdk/lib-storage');
-const stream = require('stream'); // স্ট্রিমিং লাইব্রেরি
+const stream = require('stream');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -22,53 +22,74 @@ app.get('/:fileId', async (req, res) => {
     const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${r2Key}`;
 
     try {
+        // ১. আগে চেক করি ফাইলটি R2 বাকেটে অলরেডি আছে কি না
+        try {
+            const headData = await s3Client.send(new HeadObjectCommand({
+                Bucket: process.env.R2_BUCKET_NAME,
+                Key: r2Key
+            }));
+            
+            // ফাইল থাকলে সাথে সাথে সাকসেস রেসপন্স দিন
+            return res.json({
+                status: "success",
+                filename: `Movie_${fileId}`,
+                size: headData.ContentLength,
+                url: r2PublicUrl,
+                r2_key: r2Key
+            });
+        } catch (e) {
+            // ফাইল না থাকলে আপলোড প্রসেস শুরু হবে
+            console.log("File not found in R2, starting upload...");
+        }
+
+        // ২. Google Drive থেকে স্ট্রীম রিকোয়েস্ট
         const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
         
-        // ১. রেসপন্স স্ট্রীম হিসেবে নেওয়া (মেমোরি সেভ করবে)
         const response = await axios({
             method: 'get',
             url: gDriveUrl,
             responseType: 'stream',
-            timeout: 0 // বড় ফাইলের জন্য টাইমআউট বন্ধ রাখা
+            timeout: 0
         });
 
-        // ২. সরাসরি পাস-থ্রু স্ট্রিম তৈরি
         const passThrough = new stream.PassThrough();
         response.data.pipe(passThrough);
 
+        // ৩. R2-তে স্মার্ট আপলোড
         const parallelUploads3 = new Upload({
             client: s3Client,
             params: {
                 Bucket: process.env.R2_BUCKET_NAME,
                 Key: r2Key,
-                Body: passThrough, // স্ট্রীম বডি ব্যবহার করা হয়েছে
+                Body: passThrough,
                 ContentType: response.headers['content-type'] || 'video/mp4'
             },
-            // ৩. বড় ফাইল যেন RAM না খায় তাই চাঙ্ক সাইজ কমানো (৫ মেগাবাইট করে)
-            queueSize: 1, 
-            partSize: 1024 * 1024 * 5 
+            queueSize: 1, // মেমোরি বাঁচাতে মাত্র ১টি চাঙ্ক কিউতে রাখা
+            partSize: 1024 * 1024 * 5 // ৫ মেগাবাইট চাঙ্ক
         });
 
-        // আপলোড চলাকালীন PHP কে একটি মেসেজ দিন যাতে সে ওয়েট করে
-        parallelUploads3.done().then(() => {
-            console.log("Upload Completed for:", fileId);
-        }).catch(err => {
-            console.error("Upload Error:", err);
-        });
+        // ৪. আপলোড সম্পূর্ণ হওয়া পর্যন্ত অপেক্ষা করা
+        await parallelUploads3.done();
+        console.log("Upload Completed for:", fileId);
 
-        // PHP কে সাথে সাথে সাকসেস বা প্রসেসিং রেসপন্স দিন
-        // প্রথমবার কল করলে এটি সরাসরি সাকসেস ডাটা রিটার্ন করবে
+        // ৫. সফল রেসপন্স
         res.json({
             status: "success",
             filename: `Movie_${fileId}`,
-            size: response.headers['content-length'] || "Unknown",
+            size: response.headers['content-length'] || 0,
             url: r2PublicUrl,
             r2_key: r2Key
         });
 
     } catch (error) {
         console.error("Process Error:", error.message);
-        res.status(500).json({ status: "error", message: error.message });
+        
+        // এরর হলে আপনার PHP যেন প্রসেসিং পেজেই থাকে তার ব্যবস্থা করা
+        res.json({ 
+            status: "processing", 
+            message: "File is being prepared or transient error occurred. Refreshing...",
+            error: error.message 
+        });
     }
 });
 
