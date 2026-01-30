@@ -18,7 +18,6 @@ const s3Client = new S3Client({
 
 const activeUploads = new Set();
 
-// ১. Favicon এবং রুট রিকোয়েস্ট হ্যান্ডলিং
 app.get('/favicon.ico', (req, res) => res.status(204).end());
 app.get('/', (req, res) => res.send("API Service is Running..."));
 
@@ -29,39 +28,41 @@ app.get('/:fileId', async (req, res) => {
         return res.status(400).json({ status: "error", message: "Invalid File ID" });
     }
 
-    const r2Key = `${fileName}.mp4`;
-    const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${r2Key}`;
+    // ১. Google Drive Metadata সংগ্রহ (আসল নাম ও সাইজ)
+    const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size&key=${process.env.GDRIVE_API_KEY}`;
+    let fileName = `Movie_${fileId}`; 
+    let fileSize = 0;
 
     try {
-        // ২. Google Drive থেকে ফাইলের নাম এবং সাইজ সংগ্রহ (Metadata)
-        const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size&key=${process.env.GDRIVE_API_KEY}`;
-        let fileName = `Movie_${fileId}`; // ডিফল্ট নাম
-        let fileSize = 0;
+        const metaResponse = await axios.get(metaUrl);
+        fileName = metaResponse.data.name; 
+        fileSize = parseInt(metaResponse.data.size) || 0;
+    } catch (e) {
+        console.error("Meta Fetch Error:", e.message);
+    }
 
-        try {
-            const metaResponse = await axios.get(metaUrl);
-            fileName = metaResponse.data.name; // আসল নাম উদ্ধার
-            fileSize = parseInt(metaResponse.data.size) || 0;
-        } catch (e) {
-            console.error("Meta Fetch Error:", e.message);
-        }
+    // ২. R2 বাকেট কি (Key) - স্টোরেজের জন্য আইডি ব্যবহার করাই সবচেয়ে নিরাপদ
+    const r2KeyForStorage = `${fileId}.mp4`; 
+    const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${r2KeyForStorage}`;
 
+    try {
         // ৩. R2 বাকেটে ফাইল আছে কি না চেক
         try {
             const headData = await s3Client.send(new HeadObjectCommand({
                 Bucket: process.env.R2_BUCKET_NAME,
-                Key: r2Key
+                Key: r2KeyForStorage
             }));
             
+            // সাকসেস রেসপন্স (আপনার চাহিদা মতো r2_key তে আসল নাম পাঠানো হচ্ছে)
             return res.json({
                 status: "success",
                 filename: fileName,
                 size: headData.ContentLength || fileSize,
                 url: r2PublicUrl,
-                r2_key: r2Key
+                r2_key: fileName // এখানে আপনার চাহিদা মতো অরিজিনাল ফাইল নেম দেওয়া হয়েছে
             });
         } catch (e) {
-            // ফাইল নেই, আপলোড প্রসেসে যাবে
+            // ফাইল নেই
         }
 
         // ৪. অলরেডি আপলোড চলছে কি না চেক
@@ -69,7 +70,7 @@ app.get('/:fileId', async (req, res) => {
             return res.json({
                 status: "processing",
                 filename: fileName,
-                message: "File is being uploaded to storage... please wait.",
+                message: "File is being uploaded... please wait.",
                 progress: "Running"
             });
         }
@@ -77,25 +78,22 @@ app.get('/:fileId', async (req, res) => {
         // ৫. ব্যাকগ্রাউন্ড আপলোড ফাংশন
         const startUpload = async () => {
             activeUploads.add(fileId);
-            console.log(`Starting background upload for: ${fileName} (${fileId})`);
+            console.log(`Starting upload for: ${fileName}`);
             
             try {
                 const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
                 const response = await axios({ method: 'get', url: gDriveUrl, responseType: 'stream', timeout: 0 });
 
-                const passThrough = new stream.PassThrough();
-                response.data.pipe(passThrough);
-
                 const upload = new Upload({
                     client: s3Client,
                     params: {
                         Bucket: process.env.R2_BUCKET_NAME,
-                        Key: r2Key,
-                        Body: passThrough,
+                        Key: r2KeyForStorage,
+                        Body: response.data.pipe(new stream.PassThrough()),
                         ContentType: response.headers['content-type'] || 'video/mp4'
                     },
                     queueSize: 4,
-                    partSize: 1024 * 1024 * 10
+                    partSize: 1024 * 1024 * 10 // 10MB চাঙ্ক স্পিড বাড়ানোর জন্য
                 });
 
                 await upload.done();
@@ -107,14 +105,13 @@ app.get('/:fileId', async (req, res) => {
             }
         };
 
-        // ফায়ার অ্যান্ড ফরগেট (Fire and Forget)
         startUpload();
 
-        // ৬. প্রসেসিং রেসপন্স (এখন আসল নামসহ দেখাবে)
+        // ৬. প্রসেসিং রেসপন্স
         res.json({
             status: "processing",
             filename: fileName,
-            message: "Initialization successful. Processing in background.",
+            message: "Initialization successful. High-speed upload started.",
             progress: "Starting"
         });
 
@@ -125,6 +122,3 @@ app.get('/:fileId', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
-
-
