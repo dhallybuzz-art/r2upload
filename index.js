@@ -16,20 +16,22 @@ const s3Client = new S3Client({
     },
 });
 
+// আপলোড ট্র্যাকিং করার জন্য একটি সিম্পল অবজেক্ট
+const activeUploads = new Set();
+
 app.get('/:fileId', async (req, res) => {
     const fileId = req.params.fileId;
     const r2Key = `storage/${fileId}.mp4`;
     const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${r2Key}`;
 
     try {
-        // ১. আগে চেক করি ফাইলটি R2 বাকেটে অলরেডি আছে কি না
+        // ১. চেক করি ফাইলটি ইতিমধ্যে R2 তে আছে কি না
         try {
             const headData = await s3Client.send(new HeadObjectCommand({
                 Bucket: process.env.R2_BUCKET_NAME,
                 Key: r2Key
             }));
             
-            // ফাইল থাকলে সাথে সাথে সাকসেস রেসপন্স দিন
             return res.json({
                 status: "success",
                 filename: `Movie_${fileId}`,
@@ -38,58 +40,61 @@ app.get('/:fileId', async (req, res) => {
                 r2_key: r2Key
             });
         } catch (e) {
-            // ফাইল না থাকলে আপলোড প্রসেস শুরু হবে
-            console.log("File not found in R2, starting upload...");
+            console.log(`File ${fileId} not in R2.`);
         }
 
-        // ২. Google Drive থেকে স্ট্রীম রিকোয়েস্ট
-        const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
-        
-        const response = await axios({
-            method: 'get',
-            url: gDriveUrl,
-            responseType: 'stream',
-            timeout: 0
-        });
+        // ২. যদি ফাইলটি এখন আপলোড হতে থাকে
+        if (activeUploads.has(fileId)) {
+            return res.json({
+                status: "processing",
+                message: "Uploading in progress... please wait.",
+                progress: "50%" // স্ট্যাটিক মেসেজ
+            });
+        }
 
-        const passThrough = new stream.PassThrough();
-        response.data.pipe(passThrough);
+        // ৩. নতুন আপলোড শুরু করা (Background Task)
+        const startUpload = async () => {
+            activeUploads.add(fileId);
+            try {
+                const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
+                const response = await axios({ method: 'get', url: gDriveUrl, responseType: 'stream', timeout: 0 });
 
-        // ৩. R2-তে স্মার্ট আপলোড
-        const parallelUploads3 = new Upload({
-            client: s3Client,
-            params: {
-                Bucket: process.env.R2_BUCKET_NAME,
-                Key: r2Key,
-                Body: passThrough,
-                ContentType: response.headers['content-type'] || 'video/mp4'
-            },
-            queueSize: 1, // মেমোরি বাঁচাতে মাত্র ১টি চাঙ্ক কিউতে রাখা
-            partSize: 1024 * 1024 * 5 // ৫ মেগাবাইট চাঙ্ক
-        });
+                const passThrough = new stream.PassThrough();
+                response.data.pipe(passThrough);
 
-        // ৪. আপলোড সম্পূর্ণ হওয়া পর্যন্ত অপেক্ষা করা
-        await parallelUploads3.done();
-        console.log("Upload Completed for:", fileId);
+                const parallelUploads3 = new Upload({
+                    client: s3Client,
+                    params: {
+                        Bucket: process.env.R2_BUCKET_NAME,
+                        Key: r2Key,
+                        Body: passThrough,
+                        ContentType: response.headers['content-type'] || 'video/mp4'
+                    },
+                    queueSize: 1,
+                    partSize: 1024 * 1024 * 5
+                });
 
-        // ৫. সফল রেসপন্স
+                await parallelUploads3.done();
+                console.log(`Successfully uploaded: ${fileId}`);
+            } catch (err) {
+                console.error(`Upload failed for ${fileId}:`, err.message);
+            } finally {
+                activeUploads.delete(fileId);
+            }
+        };
+
+        // আপলোড শুরু করুন কিন্তু 'await' করবেন না
+        startUpload();
+
+        // ৪. PHP-কে সাথে সাথে রেসপন্স দিন (Time-out এড়াতে)
         res.json({
-            status: "success",
-            filename: `Movie_${fileId}`,
-            size: response.headers['content-length'] || 0,
-            url: r2PublicUrl,
-            r2_key: r2Key
+            status: "processing",
+            message: "Upload started. This might take a few minutes for large files.",
+            progress: "10%"
         });
 
     } catch (error) {
-        console.error("Process Error:", error.message);
-        
-        // এরর হলে আপনার PHP যেন প্রসেসিং পেজেই থাকে তার ব্যবস্থা করা
-        res.json({ 
-            status: "processing", 
-            message: "File is being prepared or transient error occurred. Refreshing...",
-            error: error.message 
-        });
+        res.json({ status: "error", message: error.message });
     }
 });
 
