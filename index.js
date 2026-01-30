@@ -29,7 +29,7 @@ app.get('/:fileId', async (req, res) => {
         return res.status(400).json({ status: "error", message: "Invalid File ID" });
     }
 
-    const r2Key = ${fileName};
+    const r2Key = `${fileId}.mp4`;
     const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${r2Key}`;
 
     try {
@@ -125,4 +125,5 @@ app.get('/:fileId', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
 
