@@ -19,105 +19,110 @@ const s3Client = new S3Client({
 const activeUploads = new Set();
 
 app.get('/favicon.ico', (req, res) => res.status(204).end());
+app.get('/', (req, res) => res.send("API Service is Online."));
 
 app.get('/:fileId', async (req, res) => {
     const fileId = req.params.fileId;
+    
     if (!fileId || fileId.length < 15) {
-        return res.status(400).json({ status: "error", message: "Invalid ID" });
+        return res.status(400).json({ status: "error", message: "Invalid File ID" });
     }
 
-    const r2KeyForStorage = `${fileId}.mp4`;
-    const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${r2KeyForStorage}`;
-
     try {
-        // ১. Google Drive Metadata
+        // ১. Google Drive Metadata সংগ্রহ (আসল নাম ও সাইজ)
         const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size&key=${process.env.GDRIVE_API_KEY}`;
-        let fileName = `Movie_${fileId}`;
+        let fileName = `Movie_${fileId}`; 
         let fileSize = 0;
 
         try {
             const metaResponse = await axios.get(metaUrl);
-            fileName = metaResponse.data.name || fileName;
+            fileName = metaResponse.data.name; 
             fileSize = parseInt(metaResponse.data.size) || 0;
         } catch (e) {
-            console.error("Metadata Fetch Failed");
+            console.error("Meta Fetch Error (Check API Key or File Privacy):", e.message);
         }
 
-        // ২. R2 Check
+        const r2KeyForStorage = `${fileId}.mp4`; 
+        const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${r2KeyForStorage}`;
+
+        // ২. R2 বাকেটে ফাইল আছে কি না চেক
         try {
             const headData = await s3Client.send(new HeadObjectCommand({
                 Bucket: process.env.R2_BUCKET_NAME,
                 Key: r2KeyForStorage
             }));
-
-            const originalNameFromMeta =
-                headData.Metadata?.originalname || fileName;
-
+            
             return res.json({
                 status: "success",
-                filename: originalNameFromMeta,
+                filename: fileName,
                 size: headData.ContentLength || fileSize,
                 url: r2PublicUrl,
-                r2_key: originalNameFromMeta
+                r2_key: fileName 
             });
-
         } catch (e) {
-            // Not found in R2 → upload শুরু হবে
+            // ফাইল নেই, আপলোড শুরু হবে
         }
 
-        // ৩. Background Upload
-        if (!activeUploads.has(fileId)) {
-            const startUpload = async () => {
-                activeUploads.add(fileId);
-                console.log(`Starting background upload: ${fileName}`);
-
-                try {
-                    const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
-
-                    const response = await axios({
-                        method: 'get',
-                        url: gDriveUrl,
-                        responseType: 'stream',
-                        timeout: 0
-                    });
-
-                    const upload = new Upload({
-                        client: s3Client,
-                        params: {
-                            Bucket: process.env.R2_BUCKET_NAME,
-                            Key: r2KeyForStorage,
-                            Body: response.data.pipe(new stream.PassThrough()),
-                            ContentType: response.headers['content-type'] || 'video/mp4',
-                            Metadata: {
-                                originalname: fileName
-                            }
-                        },
-                        queueSize: 4,
-                        partSize: 1024 * 1024 * 10
-                    });
-
-                    await upload.done();
-                    console.log(`Successfully uploaded: ${fileName}`);
-
-                } catch (err) {
-                    console.error(`Upload error:`, err.message);
-                } finally {
-                    activeUploads.delete(fileId);
-                }
-            };
-
-            startUpload();
+        // ৩. অলরেডি আপলোড চলছে কি না চেক
+        if (activeUploads.has(fileId)) {
+            return res.json({
+                status: "processing",
+                filename: fileName,
+                message: "File is being uploaded to storage... please wait.",
+                progress: "Running"
+            });
         }
 
-        return res.json({
+        // ৪. ব্যাকগ্রাউন্ড আপলোড ফাংশন
+        const startUpload = async () => {
+            activeUploads.add(fileId);
+            console.log(`Starting background upload for: ${fileName}`);
+            
+            try {
+                const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
+                
+                // ৪MD এরর এড়াতে সরাসরি স্ট্রীম রেসপন্স
+                const response = await axios({ 
+                    method: 'get', 
+                    url: gDriveUrl, 
+                    responseType: 'stream', 
+                    timeout: 0 
+                });
+
+                const upload = new Upload({
+                    client: s3Client,
+                    params: {
+                        Bucket: process.env.R2_BUCKET_NAME,
+                        Key: r2KeyForStorage,
+                        Body: response.data.pipe(new stream.PassThrough()),
+                        ContentType: response.headers['content-type'] || 'video/mp4'
+                    },
+                    // Heroku RAM লিমিট এড়াতে queueSize কমিয়ে ১ রাখা নিরাপদ
+                    queueSize: 1, 
+                    partSize: 1024 * 1024 * 10 // 10MB চাঙ্ক
+                });
+
+                await upload.done();
+                console.log(`Successfully finished: ${fileName}`);
+            } catch (err) {
+                console.error(`Upload error (Check 403/Forbidden):`, err.message);
+            } finally {
+                activeUploads.delete(fileId);
+            }
+        };
+
+        startUpload();
+
+        res.json({
             status: "processing",
             filename: fileName,
             message: "Initialization successful. Processing in background.",
-            progress: "Running"
+            progress: "Starting"
         });
 
     } catch (error) {
-        return res.json({ status: "processing", message: "Retrying..." });
+        console.error("Endpoint Error:", error.message);
+        res.json({ status: "processing", message: "Retrying..." });
     }
 });
 
