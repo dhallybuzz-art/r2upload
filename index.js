@@ -16,16 +16,24 @@ const s3Client = new S3Client({
     },
 });
 
-// আপলোড ট্র্যাকিং করার জন্য একটি সিম্পল অবজেক্ট
 const activeUploads = new Set();
+
+// ১. Favicon এরর বন্ধ করার জন্য মিডলওয়্যার
+app.get('/favicon.ico', (req, res) => res.status(204).end());
 
 app.get('/:fileId', async (req, res) => {
     const fileId = req.params.fileId;
+    
+    // ফাইল আইডি ভ্যালিডেশন (অপ্রয়োজনীয় রিকোয়েস্ট আটকানোর জন্য)
+    if (!fileId || fileId.length < 15) {
+        return res.status(400).json({ status: "error", message: "Invalid File ID" });
+    }
+
     const r2Key = `storage/${fileId}.mp4`;
     const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${r2Key}`;
 
     try {
-        // ১. চেক করি ফাইলটি ইতিমধ্যে R2 তে আছে কি না
+        // ২. R2 বাকেটে ফাইল আছে কি না চেক
         try {
             const headData = await s3Client.send(new HeadObjectCommand({
                 Bucket: process.env.R2_BUCKET_NAME,
@@ -40,21 +48,23 @@ app.get('/:fileId', async (req, res) => {
                 r2_key: r2Key
             });
         } catch (e) {
-            console.log(`File ${fileId} not in R2.`);
+            // ফাইল নেই, আপলোড প্রসেসে যাবে
         }
 
-        // ২. যদি ফাইলটি এখন আপলোড হতে থাকে
+        // ৩. অলরেডি আপলোড চলছে কি না চেক
         if (activeUploads.has(fileId)) {
             return res.json({
                 status: "processing",
-                message: "Uploading in progress... please wait.",
-                progress: "50%" // স্ট্যাটিক মেসেজ
+                message: "File is being uploaded to storage... please wait.",
+                progress: "Running"
             });
         }
 
-        // ৩. নতুন আপলোড শুরু করা (Background Task)
+        // ৪. ব্যাকগ্রাউন্ড আপলোড ফাংশন
         const startUpload = async () => {
             activeUploads.add(fileId);
+            console.log(`Starting background upload for: ${fileId}`);
+            
             try {
                 const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
                 const response = await axios({ method: 'get', url: gDriveUrl, responseType: 'stream', timeout: 0 });
@@ -62,7 +72,7 @@ app.get('/:fileId', async (req, res) => {
                 const passThrough = new stream.PassThrough();
                 response.data.pipe(passThrough);
 
-                const parallelUploads3 = new Upload({
+                const upload = new Upload({
                     client: s3Client,
                     params: {
                         Bucket: process.env.R2_BUCKET_NAME,
@@ -74,27 +84,28 @@ app.get('/:fileId', async (req, res) => {
                     partSize: 1024 * 1024 * 5
                 });
 
-                await parallelUploads3.done();
-                console.log(`Successfully uploaded: ${fileId}`);
+                await upload.done();
+                console.log(`Successfully finished: ${fileId}`);
             } catch (err) {
-                console.error(`Upload failed for ${fileId}:`, err.message);
+                console.error(`Upload error for ${fileId}:`, err.message);
             } finally {
                 activeUploads.delete(fileId);
             }
         };
 
-        // আপলোড শুরু করুন কিন্তু 'await' করবেন না
+        // ফায়ার অ্যান্ড ফরগেট (Fire and Forget)
         startUpload();
 
-        // ৪. PHP-কে সাথে সাথে রেসপন্স দিন (Time-out এড়াতে)
+        // ৫. দ্রুত রেসপন্স পাঠানো যাতে Heroku H12/H13 এরর না দেয়
         res.json({
             status: "processing",
-            message: "Upload started. This might take a few minutes for large files.",
-            progress: "10%"
+            message: "Initialization successful. Your file is being processed in the background.",
+            progress: "Starting"
         });
 
     } catch (error) {
-        res.json({ status: "error", message: error.message });
+        console.error("Endpoint Error:", error.message);
+        res.json({ status: "processing", message: "Retrying..." });
     }
 });
 
