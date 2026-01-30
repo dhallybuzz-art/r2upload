@@ -29,7 +29,7 @@ app.get('/:fileId', async (req, res) => {
         return res.status(400).json({ status: "error", message: "Invalid File ID" });
     }
 
-    const r2Key = `storage/${fileId}.mp4`;
+    const r2Key = ${fileName};
     const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${r2Key}`;
 
     try {
@@ -94,8 +94,8 @@ app.get('/:fileId', async (req, res) => {
                         Body: passThrough,
                         ContentType: response.headers['content-type'] || 'video/mp4'
                     },
-                    queueSize: 1,
-                    partSize: 1024 * 1024 * 5
+                    queueSize: 4,
+                    partSize: 1024 * 1024 * 10
                 });
 
                 await upload.done();
@@ -125,3 +125,4 @@ app.get('/:fileId', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
