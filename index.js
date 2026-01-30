@@ -18,13 +18,13 @@ const s3Client = new S3Client({
 
 const activeUploads = new Set();
 
-// ১. Favicon এরর বন্ধ করার জন্য মিডলওয়্যার
+// ১. Favicon এবং রুট রিকোয়েস্ট হ্যান্ডলিং
 app.get('/favicon.ico', (req, res) => res.status(204).end());
+app.get('/', (req, res) => res.send("API Service is Running..."));
 
 app.get('/:fileId', async (req, res) => {
     const fileId = req.params.fileId;
     
-    // ফাইল আইডি ভ্যালিডেশন (অপ্রয়োজনীয় রিকোয়েস্ট আটকানোর জন্য)
     if (!fileId || fileId.length < 15) {
         return res.status(400).json({ status: "error", message: "Invalid File ID" });
     }
@@ -33,7 +33,20 @@ app.get('/:fileId', async (req, res) => {
     const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${r2Key}`;
 
     try {
-        // ২. R2 বাকেটে ফাইল আছে কি না চেক
+        // ২. Google Drive থেকে ফাইলের নাম এবং সাইজ সংগ্রহ (Metadata)
+        const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size&key=${process.env.GDRIVE_API_KEY}`;
+        let fileName = `Movie_${fileId}`; // ডিফল্ট নাম
+        let fileSize = 0;
+
+        try {
+            const metaResponse = await axios.get(metaUrl);
+            fileName = metaResponse.data.name; // আসল নাম উদ্ধার
+            fileSize = parseInt(metaResponse.data.size) || 0;
+        } catch (e) {
+            console.error("Meta Fetch Error:", e.message);
+        }
+
+        // ৩. R2 বাকেটে ফাইল আছে কি না চেক
         try {
             const headData = await s3Client.send(new HeadObjectCommand({
                 Bucket: process.env.R2_BUCKET_NAME,
@@ -42,8 +55,8 @@ app.get('/:fileId', async (req, res) => {
             
             return res.json({
                 status: "success",
-                filename: `Movie_${fileId}`,
-                size: headData.ContentLength,
+                filename: fileName,
+                size: headData.ContentLength || fileSize,
                 url: r2PublicUrl,
                 r2_key: r2Key
             });
@@ -51,19 +64,20 @@ app.get('/:fileId', async (req, res) => {
             // ফাইল নেই, আপলোড প্রসেসে যাবে
         }
 
-        // ৩. অলরেডি আপলোড চলছে কি না চেক
+        // ৪. অলরেডি আপলোড চলছে কি না চেক
         if (activeUploads.has(fileId)) {
             return res.json({
                 status: "processing",
+                filename: fileName,
                 message: "File is being uploaded to storage... please wait.",
                 progress: "Running"
             });
         }
 
-        // ৪. ব্যাকগ্রাউন্ড আপলোড ফাংশন
+        // ৫. ব্যাকগ্রাউন্ড আপলোড ফাংশন
         const startUpload = async () => {
             activeUploads.add(fileId);
-            console.log(`Starting background upload for: ${fileId}`);
+            console.log(`Starting background upload for: ${fileName} (${fileId})`);
             
             try {
                 const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
@@ -85,7 +99,7 @@ app.get('/:fileId', async (req, res) => {
                 });
 
                 await upload.done();
-                console.log(`Successfully finished: ${fileId}`);
+                console.log(`Successfully finished: ${fileName}`);
             } catch (err) {
                 console.error(`Upload error for ${fileId}:`, err.message);
             } finally {
@@ -96,10 +110,11 @@ app.get('/:fileId', async (req, res) => {
         // ফায়ার অ্যান্ড ফরগেট (Fire and Forget)
         startUpload();
 
-        // ৫. দ্রুত রেসপন্স পাঠানো যাতে Heroku H12/H13 এরর না দেয়
+        // ৬. প্রসেসিং রেসপন্স (এখন আসল নামসহ দেখাবে)
         res.json({
             status: "processing",
-            message: "Initialization successful. Your file is being processed in the background.",
+            filename: fileName,
+            message: "Initialization successful. Processing in background.",
             progress: "Starting"
         });
 
