@@ -25,9 +25,9 @@ app.get('/:fileId', async (req, res) => {
     if (!fileId || fileId.length < 15) return res.status(400).json({ status: "error", message: "Invalid ID" });
 
     try {
-        // ১. Metadata সংগ্রহ (আসল নাম উদ্ধার)
+        // ১. Google Drive Metadata সংগ্রহ (আসল নাম উদ্ধার)
         const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size&key=${process.env.GDRIVE_API_KEY}`;
-        let fileName = `Movie_${fileId}`; 
+        let fileName = `Movie_${fileId}.mkv`; 
         let fileSize = 0;
 
         try {
@@ -38,14 +38,16 @@ app.get('/:fileId', async (req, res) => {
             console.error("Meta Fetch Error:", e.message);
         }
 
-        const r2KeyForStorage = `${fileId}.mp4`; 
-        const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${r2KeyForStorage}`;
+        // ২. বাকেট Key নির্ধারণ (এখন আসল নামেই R2 তে সেভ হবে)
+        const r2Key = fileName; 
+        const encodedKey = encodeURIComponent(r2Key); // URL-এর জন্য নাম এনকোড করা
+        const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${encodedKey}`;
 
-        // ২. R2 চেক
+        // ৩. R2 চেক
         try {
             const headData = await s3Client.send(new HeadObjectCommand({
                 Bucket: process.env.R2_BUCKET_NAME,
-                Key: r2KeyForStorage
+                Key: r2Key
             }));
             
             return res.json({
@@ -53,11 +55,11 @@ app.get('/:fileId', async (req, res) => {
                 filename: fileName,
                 size: headData.ContentLength || fileSize,
                 url: r2PublicUrl,
-                r2_key: fileName 
+                r2_key: r2Key 
             });
-        } catch (e) {}
+        } catch (e) { /* ফাইল নেই */ }
 
-        // ৩. ব্যাকগ্রাউন্ড আপলোড (Content-Disposition হেডারসহ)
+        // ৪. ব্যাকগ্রাউন্ড আপলোড (আসল নাম এবং হেডারসহ)
         if (!activeUploads.has(fileId)) {
             const startUpload = async () => {
                 activeUploads.add(fileId);
@@ -70,20 +72,20 @@ app.get('/:fileId', async (req, res) => {
                         client: s3Client,
                         params: {
                             Bucket: process.env.R2_BUCKET_NAME,
-                            Key: r2KeyForStorage,
+                            Key: r2Key, // R2-তে এই নামেই ফাইলটি জমা হবে
                             Body: response.data.pipe(new stream.PassThrough()),
-                            ContentType: response.headers['content-type'] || 'video/mp4',
-                            // এই লাইনটি আসল নামে ডাউনলোড নিশ্চিত করবে
+                            ContentType: response.headers['content-type'] || 'video/x-matroska',
+                            // এটি ডাউনলোডের সময় আসল নাম নিশ্চিত করবে
                             ContentDisposition: `attachment; filename="${fileName}"`
                         },
-                        queueSize: 1,
+                        queueSize: 1, 
                         partSize: 1024 * 1024 * 10
                     });
 
                     await upload.done();
                     console.log(`Successfully finished: ${fileName}`);
                 } catch (err) {
-                    console.error(`Upload error for ${fileId}:`, err.message);
+                    console.error(`Upload error:`, err.message);
                 } finally {
                     activeUploads.delete(fileId);
                 }
@@ -94,12 +96,12 @@ app.get('/:fileId', async (req, res) => {
         res.json({
             status: "processing",
             filename: fileName,
-            message: "Processing background upload. Please wait...",
+            message: "Upload started with original filename. Please wait.",
             progress: "Running"
         });
 
     } catch (error) {
-        res.json({ status: "processing", message: "Retrying..." });
+        res.json({ status: "processing", message: "Initialing..." });
     }
 });
 
