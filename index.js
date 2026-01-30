@@ -19,17 +19,16 @@ const s3Client = new S3Client({
 const activeUploads = new Set();
 
 app.get('/favicon.ico', (req, res) => res.status(204).end());
-app.get('/', (req, res) => res.send("API Service is Running..."));
 
 app.get('/:fileId', async (req, res) => {
     const fileId = req.params.fileId;
-    
-    if (!fileId || fileId.length < 15) {
-        return res.status(400).json({ status: "error", message: "Invalid File ID" });
-    }
+    if (!fileId || fileId.length < 15) return res.status(400).json({ status: "error", message: "Invalid ID" });
+
+    const r2KeyForStorage = `${fileId}.mp4`; 
+    const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${r2KeyForStorage}`;
 
     try {
-        // ১. Google Drive Metadata সংগ্রহ (আসল নাম ও সাইজ)
+        // ১. ফাইলের মেটাডাটা সংগ্রহ
         const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size&key=${process.env.GDRIVE_API_KEY}`;
         let fileName = `Movie_${fileId}`; 
         let fileSize = 0;
@@ -39,21 +38,16 @@ app.get('/:fileId', async (req, res) => {
             fileName = metaResponse.data.name; 
             fileSize = parseInt(metaResponse.data.size) || 0;
         } catch (e) {
-            console.error("Meta Fetch Error:", e.message);
+            console.error("Metadata Fetch Failed - Check API Key or File Privacy");
         }
 
-        // ২. বাকেট Key নির্ধারণ (বাকেটে সেভ হবে ID নামে, কিন্তু রেসপন্সে যাবে আসল নাম)
-        const r2KeyForStorage = `${fileId}.mp4`; 
-        const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${r2KeyForStorage}`;
-
-        // ৩. R2 বাকেটে ফাইল আছে কি না চেক
+        // ২. R2 চেক (যদি আগে আপলোড হয়ে থাকে)
         try {
             const headData = await s3Client.send(new HeadObjectCommand({
                 Bucket: process.env.R2_BUCKET_NAME,
                 Key: r2KeyForStorage
             }));
             
-            // সাকসেস রেসপন্স (আপনার চাহিদা মতো r2_key তে আসল নাম পাঠানো হচ্ছে)
             return res.json({
                 status: "success",
                 filename: fileName,
@@ -61,62 +55,51 @@ app.get('/:fileId', async (req, res) => {
                 url: r2PublicUrl,
                 r2_key: fileName 
             });
-        } catch (e) {
-            // ফাইল নেই
+        } catch (e) {}
+
+        // ৩. ব্যাকগ্রাউন্ড আপলোড লজিক
+        if (!activeUploads.has(fileId)) {
+            const startUpload = async () => {
+                activeUploads.add(fileId);
+                console.log(`Starting background upload: ${fileName}`);
+                
+                try {
+                    const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
+                    
+                    // ৪MD এরর এড়াতে সরাসরি স্ট্রীম ব্যবহার
+                    const response = await axios({ method: 'get', url: gDriveUrl, responseType: 'stream', timeout: 0 });
+
+                    const upload = new Upload({
+                        client: s3Client,
+                        params: {
+                            Bucket: process.env.R2_BUCKET_NAME,
+                            Key: r2KeyForStorage,
+                            Body: response.data.pipe(new stream.PassThrough()),
+                            ContentType: response.headers['content-type'] || 'video/mp4'
+                        },
+                        queueSize: 4, // স্পিড বাড়াবে
+                        partSize: 1024 * 1024 * 10 // ১০ মেগাবাইট চাঙ্ক (মেমোরি সাশ্রয়ী)
+                    });
+
+                    await upload.done();
+                    console.log(`Successfully uploaded: ${fileName}`);
+                } catch (err) {
+                    console.error(`Upload error (Check 403 Forbidden):`, err.message);
+                } finally {
+                    activeUploads.delete(fileId);
+                }
+            };
+            startUpload();
         }
 
-        // ৪. অলরেডি আপলোড চলছে কি না চেক
-        if (activeUploads.has(fileId)) {
-            return res.json({
-                status: "processing",
-                filename: fileName,
-                message: "File is being uploaded... please wait.",
-                progress: "Running"
-            });
-        }
-
-        // ৫. ব্যাকগ্রাউন্ড আপলোড ফাংশন
-        const startUpload = async () => {
-            activeUploads.add(fileId);
-            console.log(`Starting upload for: ${fileName}`);
-            
-            try {
-                const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
-                const response = await axios({ method: 'get', url: gDriveUrl, responseType: 'stream', timeout: 0 });
-
-                const upload = new Upload({
-                    client: s3Client,
-                    params: {
-                        Bucket: process.env.R2_BUCKET_NAME,
-                        Key: r2KeyForStorage, // বাকেটে আইডি দিয়ে সেভ হবে
-                        Body: response.data.pipe(new stream.PassThrough()),
-                        ContentType: response.headers['content-type'] || 'video/mp4'
-                    },
-                    queueSize: 4,
-                    partSize: 1024 * 1024 * 10 // 10MB চাঙ্ক
-                });
-
-                await upload.done();
-                console.log(`Successfully finished: ${fileName}`);
-            } catch (err) {
-                console.error(`Upload error for ${fileId}:`, err.message);
-            } finally {
-                activeUploads.delete(fileId);
-            }
-        };
-
-        startUpload();
-
-        // ৬. প্রসেসিং রেসপন্স
         res.json({
             status: "processing",
             filename: fileName,
-            message: "Initialization successful. High-speed upload started.",
-            progress: "Starting"
+            message: "Initialization successful. Processing in background.",
+            progress: "Running"
         });
 
     } catch (error) {
-        console.error("Endpoint Error:", error.message);
         res.json({ status: "processing", message: "Retrying..." });
     }
 });
