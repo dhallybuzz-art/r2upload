@@ -2,11 +2,11 @@ const express = require('express');
 const axios = require('axios');
 const { S3Client } = require('@aws-sdk/client-s3');
 const { Upload } = require('@aws-sdk/lib-storage');
+const stream = require('stream'); // স্ট্রিমিং লাইব্রেরি
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// R2 Configuration (Heroku Config Vars থেকে আসবে)
 const s3Client = new S3Client({
     region: "auto",
     endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -18,55 +18,57 @@ const s3Client = new S3Client({
 
 app.get('/:fileId', async (req, res) => {
     const fileId = req.params.fileId;
-    const r2Key = `storage/${fileId}.mp4`; // ফাইলের নাম সেট করুন
+    const r2Key = `storage/${fileId}.mp4`;
     const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${r2Key}`;
 
     try {
-        // ১. প্রথমে চেক করি ফাইলটি R2 তে অলরেডি আছে কি না
-        // (এই স্টেপটি ফাস্ট রেসপন্সের জন্য জরুরি)
-
-        // ২. Google Drive থেকে স্ট্রিমিং শুরু করা
         const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
         
+        // ১. রেসপন্স স্ট্রীম হিসেবে নেওয়া (মেমোরি সেভ করবে)
         const response = await axios({
             method: 'get',
             url: gDriveUrl,
-            responseType: 'stream'
+            responseType: 'stream',
+            timeout: 0 // বড় ফাইলের জন্য টাইমআউট বন্ধ রাখা
         });
 
-        // ৩. R2 তে আপলোড শুরু (Streaming Upload)
+        // ২. সরাসরি পাস-থ্রু স্ট্রিম তৈরি
+        const passThrough = new stream.PassThrough();
+        response.data.pipe(passThrough);
+
         const parallelUploads3 = new Upload({
             client: s3Client,
             params: {
                 Bucket: process.env.R2_BUCKET_NAME,
                 Key: r2Key,
-                Body: response.data,
+                Body: passThrough, // স্ট্রীম বডি ব্যবহার করা হয়েছে
                 ContentType: response.headers['content-type'] || 'video/mp4'
             },
+            // ৩. বড় ফাইল যেন RAM না খায় তাই চাঙ্ক সাইজ কমানো (৫ মেগাবাইট করে)
+            queueSize: 1, 
+            partSize: 1024 * 1024 * 5 
         });
 
-        // PHP কে সাথে সাথে 'processing' রেসপন্স দিন (Heroku টাইমআউট এড়াতে)
-        // অথবা কাজ শেষ হওয়া পর্যন্ত অপেক্ষা করুন (যদি ফাইল ছোট হয়)
-        
-        await parallelUploads3.done();
+        // আপলোড চলাকালীন PHP কে একটি মেসেজ দিন যাতে সে ওয়েট করে
+        parallelUploads3.done().then(() => {
+            console.log("Upload Completed for:", fileId);
+        }).catch(err => {
+            console.error("Upload Error:", err);
+        });
 
-        // ৪. সফল রেসপন্স (আপনার r2new.php এই ফরম্যাটটিই আশা করে)
+        // PHP কে সাথে সাথে সাকসেস বা প্রসেসিং রেসপন্স দিন
+        // প্রথমবার কল করলে এটি সরাসরি সাকসেস ডাটা রিটার্ন করবে
         res.json({
             status: "success",
-            filename: `File_${fileId}`,
-            size: response.headers['content-length'] || 0,
+            filename: `Movie_${fileId}`,
+            size: response.headers['content-length'] || "Unknown",
             url: r2PublicUrl,
-            r2_key: r2Key,
-            worker_link: "" 
+            r2_key: r2Key
         });
 
     } catch (error) {
-        res.json({
-            status: "processing",
-            message: "File is being prepared, please wait...",
-            progress: "Calculating...",
-            speed: "Direct Stream"
-        });
+        console.error("Process Error:", error.message);
+        res.status(500).json({ status: "error", message: error.message });
     }
 });
 
