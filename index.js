@@ -18,14 +18,16 @@ const s3Client = new S3Client({
 
 const activeUploads = new Set();
 
+app.get('/favicon.ico', (req, res) => res.status(204).end());
+
 app.get('/:fileId', async (req, res) => {
     const fileId = req.params.fileId;
-    if (!fileId || fileId.length < 15) return res.status(400).json({ status: "error", message: "Invalid File ID" });
+    if (!fileId || fileId.length < 15) return res.status(400).json({ status: "error", message: "Invalid ID" });
 
     try {
-        // ১. Metadata সংগ্রহ (আসল নাম উদ্ধার)
+        // ১. Google Drive Metadata সংগ্রহ (আসল নাম উদ্ধার)
         const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size&key=${process.env.GDRIVE_API_KEY}`;
-        let fileName = `Movie_${fileId}.mkv`;
+        let fileName = `Movie_${fileId}.mkv`; 
         let fileSize = 0;
 
         try {
@@ -33,13 +35,15 @@ app.get('/:fileId', async (req, res) => {
             fileName = metaResponse.data.name; 
             fileSize = parseInt(metaResponse.data.size) || 0;
         } catch (e) {
-            return res.json({ status: "processing", message: "Check File ID or Privacy Settings." });
+            console.error("Meta Fetch Error:", e.message);
         }
 
-        const r2Key = fileName; // ফাইলটি আসল নামেই বাকেটে থাকবে
-        const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${encodeURIComponent(r2Key)}`;
+        // ২. বাকেট Key নির্ধারণ (এখন আসল নামেই R2 তে সেভ হবে)
+        const r2Key = fileName; 
+        const encodedKey = encodeURIComponent(r2Key); // URL-এর জন্য নাম এনকোড করা
+        const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${encodedKey}`;
 
-        // ২. বাকেটে আছে কি না চেক
+        // ৩. R2 চেক
         try {
             const headData = await s3Client.send(new HeadObjectCommand({
                 Bucket: process.env.R2_BUCKET_NAME,
@@ -55,31 +59,33 @@ app.get('/:fileId', async (req, res) => {
             });
         } catch (e) { /* ফাইল নেই */ }
 
-        // ৩. আপলোড প্রসেস
+        // ৪. ব্যাকগ্রাউন্ড আপলোড (আসল নাম এবং হেডারসহ)
         if (!activeUploads.has(fileId)) {
             const startUpload = async () => {
                 activeUploads.add(fileId);
+                console.log(`Starting upload for: ${fileName}`);
                 try {
                     const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
-                    const response = await axios({ method: 'get', url: gDriveUrl, responseType: 'stream' });
+                    const response = await axios({ method: 'get', url: gDriveUrl, responseType: 'stream', timeout: 0 });
 
                     const upload = new Upload({
                         client: s3Client,
                         params: {
                             Bucket: process.env.R2_BUCKET_NAME,
-                            Key: r2Key,
+                            Key: r2Key, // R2-তে এই নামেই ফাইলটি জমা হবে
                             Body: response.data.pipe(new stream.PassThrough()),
-                            ContentType: 'video/x-matroska',
-                            ContentDisposition: `attachment; filename="${fileName}"` // IDM ফিক্স
+                            ContentType: response.headers['content-type'] || 'video/x-matroska',
+                            // এটি ডাউনলোডের সময় আসল নাম নিশ্চিত করবে
+                            ContentDisposition: `attachment; filename="${fileName}"`
                         },
-                        queueSize: 1, // মেমোরি সেফ
-                        partSize: 10 * 1024 * 1024 // ১০ মেগাবাইট চাঙ্ক
+                        queueSize: 4, 
+                        partSize: 1024 * 1024 * 10
                     });
 
                     await upload.done();
-                    console.log(`Successfully Uploaded: ${fileName}`);
+                    console.log(`Successfully finished: ${fileName}`);
                 } catch (err) {
-                    console.error("403 Forbidden: File is not Public!");
+                    console.error(`Upload error:`, err.message);
                 } finally {
                     activeUploads.delete(fileId);
                 }
@@ -90,12 +96,14 @@ app.get('/:fileId', async (req, res) => {
         res.json({
             status: "processing",
             filename: fileName,
-            message: "Initial upload started. Please refresh after a while."
+            message: "Upload started with original filename. Please wait.",
+            progress: "Running"
         });
 
     } catch (error) {
-        res.json({ status: "processing" });
+        res.json({ status: "processing", message: "Initialing..." });
     }
 });
 
-app.listen(PORT, () => console.log(`Uploader running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
