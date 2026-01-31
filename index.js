@@ -1,13 +1,13 @@
 const express = require("express");
 const axios = require("axios");
 const stream = require("stream");
-const { S3Client, HeadObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, HeadObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
 const { Upload } = require("@aws-sdk/lib-storage");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* ---------- Cloudflare R2 ---------- */
+/* ---------- R2 ---------- */
 const s3 = new S3Client({
   region: "auto",
   endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -17,58 +17,44 @@ const s3 = new S3Client({
   },
 });
 
-/* ---------- In-memory upload lock ---------- */
 const active = new Set();
 
-/* ---------- Utils ---------- */
-const safeName = (name) => name.replace(/[^\w.\-()]/g, "_");
+const safeName = (n) => n.replace(/[^\w.\-()]/g, "_");
 
 const formatSize = (bytes) => {
-  if (!bytes || bytes <= 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  if (!bytes) return "0 B";
   const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  return (bytes / Math.pow(1024, i)).toFixed(2) + " " + units[i];
+  return (bytes / Math.pow(1024, i)).toFixed(2) + " " + u[i];
 };
 
-/* ---------- Fix favicon 400 ---------- */
-app.get("/favicon.ico", (req, res) => {
-  res.status(204).end();
-});
+/* ---------- favicon ---------- */
+app.get("/favicon.ico", (_, res) => res.sendStatus(204));
 
-/* ---------- Main Route ---------- */
+/* ---------- MAIN API ---------- */
 app.get("/:id", async (req, res) => {
   const id = req.params.id;
-  if (!id || id.length < 15) {
+  if (!id || id.length < 15)
     return res.status(400).json({ error: "Invalid File ID" });
-  }
 
   let fileName = `file_${id}.bin`;
   let gdriveSize = 0;
 
-  /* ---------- Google Drive metadata ---------- */
+  /* Google Drive metadata */
   try {
     const meta = await axios.get(
       `https://www.googleapis.com/drive/v3/files/${id}`,
       {
-        params: {
-          fields: "name,size",
-          key: process.env.GDRIVE_API_KEY,
-        },
+        params: { fields: "name,size", key: process.env.GDRIVE_API_KEY },
       }
     );
-
     fileName = safeName(meta.data.name || fileName);
     gdriveSize = Number(meta.data.size || 0);
-  } catch (_) {
-    // metadata optional
-  }
+  } catch (_) {}
 
   const r2Key = fileName;
-  const publicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${encodeURIComponent(
-    r2Key
-  )}`;
 
-  /* ---------- Check R2 ---------- */
+  /* Check R2 */
   try {
     const head = await s3.send(
       new HeadObjectCommand({
@@ -87,23 +73,17 @@ app.get("/:id", async (req, res) => {
       filename: r2Key,
       size: realSize,
       size_human: formatSize(realSize),
-      url: publicUrl,
+      download: `${req.protocol}://${req.get("host")}/download/${encodeURIComponent(r2Key)}`
     });
-  } catch (_) {
-    // file not found → continue
-  }
+  } catch (_) {}
 
-  /* ---------- Start upload (background) ---------- */
+  /* Upload */
   if (!active.has(id)) {
     active.add(id);
-
     (async () => {
       try {
-        const downloadUrl = `https://drive.usercontent.google.com/download?id=${id}&export=download&confirm=t`;
-
         const gstream = await axios({
-          method: "GET",
-          url: downloadUrl,
+          url: `https://drive.usercontent.google.com/download?id=${id}&export=download&confirm=t`,
           responseType: "stream",
           timeout: 0,
         });
@@ -114,35 +94,56 @@ app.get("/:id", async (req, res) => {
             Bucket: process.env.R2_BUCKET_NAME,
             Key: r2Key,
             Body: gstream.data.pipe(new stream.PassThrough()),
-            ContentType:
-              gstream.headers["content-type"] ||
-              "application/octet-stream",
+            ContentType: gstream.headers["content-type"] || "application/octet-stream",
             ContentDisposition: `attachment; filename="${r2Key}"`,
           },
-          queueSize: 4,
-          partSize: 10 * 1024 * 1024, // 10MB
+          partSize: 10 * 1024 * 1024,
         });
 
         await upload.done();
         console.log("Uploaded:", r2Key);
-      } catch (err) {
-        console.error("UPLOAD ERROR:", err.message);
+      } catch (e) {
+        console.error("UPLOAD ERROR:", e.message);
       } finally {
         active.delete(id);
       }
     })();
   }
 
-  return res.json({
+  res.json({
     status: "processing",
     filename: r2Key,
     size: gdriveSize,
     size_human: formatSize(gdriveSize),
-    message: "Upload started. Please refresh after some time.",
   });
 });
 
-/* ---------- Start server ---------- */
+/* ---------- DOWNLOAD PROXY (IDM FIX) ---------- */
+app.get("/download/:key", async (req, res) => {
+  const key = decodeURIComponent(req.params.key);
+
+  try {
+    const obj = await s3.send(
+      new GetObjectCommand({
+        Bucket: process.env.R2_BUCKET_NAME,
+        Key: key,
+      })
+    );
+
+    res.setHeader("Content-Type", obj.ContentType || "application/octet-stream");
+    res.setHeader("Content-Length", obj.ContentLength);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${key}"`
+    );
+
+    obj.Body.pipe(res);
+  } catch (e) {
+    res.status(404).json({ error: "File not found" });
+  }
+});
+
+/* ---------- Start ---------- */
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
