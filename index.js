@@ -1,109 +1,127 @@
-const express = require('express');
-const axios = require('axios');
-const { S3Client, HeadObjectCommand } = require('@aws-sdk/client-s3');
-const { Upload } = require('@aws-sdk/lib-storage');
-const stream = require('stream');
+const express = require("express");
+const axios = require("axios");
+const stream = require("stream");
+const { S3Client, HeadObjectCommand } = require("@aws-sdk/client-s3");
+const { Upload } = require("@aws-sdk/lib-storage");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const s3Client = new S3Client({
-    region: "auto",
-    endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-    credentials: {
-        accessKeyId: process.env.R2_ACCESS_KEY,
-        secretAccessKey: process.env.R2_SECRET_KEY,
-    },
+/* ---------- Cloudflare R2 ---------- */
+const s3 = new S3Client({
+  region: "auto",
+  endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId: process.env.R2_ACCESS_KEY,
+    secretAccessKey: process.env.R2_SECRET_KEY,
+  },
 });
 
-const activeUploads = new Set();
+const uploading = new Set();
 
-app.get('/favicon.ico', (req, res) => res.status(204).end());
+/* ---------- Utils ---------- */
+function safeName(name) {
+  return name.replace(/[^\w.\-()]/g, "_");
+}
 
-app.get('/:fileId', async (req, res) => {
-    const fileId = req.params.fileId;
-    if (!fileId || fileId.length < 15) return res.status(400).json({ status: "error", message: "Invalid ID" });
+/* ---------- Routes ---------- */
+app.get("/favicon.ico", (_, res) => res.sendStatus(204));
 
-    try {
-        // ১. Google Drive Metadata সংগ্রহ (আসল নাম উদ্ধার)
-        const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size&key=${process.env.GDRIVE_API_KEY}`;
-        let fileName = `Movie_${fileId}.mkv`; 
-        let fileSize = 0;
+app.get("/:fileId", async (req, res) => {
+  const fileId = req.params.fileId;
+  if (!fileId || fileId.length < 15)
+    return res.status(400).json({ error: "Invalid File ID" });
 
-        try {
-            const metaResponse = await axios.get(metaUrl);
-            fileName = metaResponse.data.name; 
-            fileSize = parseInt(metaResponse.data.size) || 0;
-        } catch (e) {
-            console.error("Meta Fetch Error:", e.message);
-        }
+  let fileName = `file_${fileId}`;
+  let fileSize = 0;
 
-        // ২. বাকেট Key নির্ধারণ (এখন আসল নামেই R2 তে সেভ হবে)
-        const r2Key = fileName; 
-        const encodedKey = encodeURIComponent(r2Key); // URL-এর জন্য নাম এনকোড করা
-        const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${encodedKey}`;
+  /* ---------- 1. Get metadata ---------- */
+  try {
+    const meta = await axios.get(
+      `https://www.googleapis.com/drive/v3/files/${fileId}`,
+      {
+        params: {
+          fields: "name,size,mimeType",
+          key: process.env.GDRIVE_API_KEY,
+        },
+      }
+    );
 
-        // ৩. R2 চেক
-        try {
-            const headData = await s3Client.send(new HeadObjectCommand({
-                Bucket: process.env.R2_BUCKET_NAME,
-                Key: r2Key
-            }));
-            
-            return res.json({
-                status: "success",
-                filename: fileName,
-                size: headData.ContentLength || fileSize,
-                url: r2PublicUrl,
-                r2_key: r2Key 
-            });
-        } catch (e) { /* ফাইল নেই */ }
+    fileName = safeName(meta.data.name || fileName);
+    fileSize = Number(meta.data.size || 0);
+  } catch {
+    fileName += ".bin";
+  }
 
-        // ৪. ব্যাকগ্রাউন্ড আপলোড (আসল নাম এবং হেডারসহ)
-        if (!activeUploads.has(fileId)) {
-            const startUpload = async () => {
-                activeUploads.add(fileId);
-                console.log(`Starting upload for: ${fileName}`);
-                try {
-                    const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
-                    const response = await axios({ method: 'get', url: gDriveUrl, responseType: 'stream', timeout: 0 });
+  const r2Key = fileName;
+  const publicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${encodeURIComponent(
+    r2Key
+  )}`;
 
-                    const upload = new Upload({
-                        client: s3Client,
-                        params: {
-                            Bucket: process.env.R2_BUCKET_NAME,
-                            Key: r2Key, // R2-তে এই নামেই ফাইলটি জমা হবে
-                            Body: response.data.pipe(new stream.PassThrough()),
-                            ContentType: response.headers['content-type'] || 'video/x-matroska',
-                            // এটি ডাউনলোডের সময় আসল নাম নিশ্চিত করবে
-                            ContentDisposition: `attachment; filename="${fileName}"`
-                        },
-                        queueSize: 4, 
-                        partSize: 1024 * 1024 * 10
-                    });
+  /* ---------- 2. Already exists? ---------- */
+  try {
+    const head = await s3.send(
+      new HeadObjectCommand({
+        Bucket: process.env.R2_BUCKET_NAME,
+        Key: r2Key,
+      })
+    );
 
-                    await upload.done();
-                    console.log(`Successfully finished: ${fileName}`);
-                } catch (err) {
-                    console.error(`Upload error:`, err.message);
-                } finally {
-                    activeUploads.delete(fileId);
-                }
-            };
-            startUpload();
-        }
+    return res.json({
+      status: "ready",
+      filename: r2Key,
+      size: head.ContentLength,
+      url: publicUrl,
+    });
+  } catch (_) {}
 
-        res.json({
-            status: "processing",
-            filename: fileName,
-            message: "Upload started with original filename. Please wait.",
-            progress: "Running"
+  /* ---------- 3. Start upload ---------- */
+  if (!uploading.has(fileId)) {
+    uploading.add(fileId);
+
+    (async () => {
+      try {
+        const gdriveStream = await axios({
+          method: "GET",
+          url: `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+          params: { key: process.env.GDRIVE_API_KEY },
+          responseType: "stream",
+          timeout: 0,
         });
 
-    } catch (error) {
-        res.json({ status: "processing", message: "Initialing..." });
-    }
+        const upload = new Upload({
+          client: s3,
+          params: {
+            Bucket: process.env.R2_BUCKET_NAME,
+            Key: r2Key,
+            Body: gdriveStream.data.pipe(new stream.PassThrough()),
+            ContentType:
+              gdriveStream.headers["content-type"] ||
+              "application/octet-stream",
+            ContentDisposition: `attachment; filename="${r2Key}"`,
+          },
+          queueSize: 4,
+          partSize: 10 * 1024 * 1024,
+        });
+
+        await upload.done();
+        console.log("Uploaded:", r2Key);
+      } catch (err) {
+        console.error("Upload failed:", err.message);
+      } finally {
+        uploading.delete(fileId);
+      }
+    })();
+  }
+
+  res.json({
+    status: "processing",
+    filename: r2Key,
+    message: "Upload started. Refresh later.",
+  });
 });
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
+/* ---------- Start ---------- */
+app.listen(PORT, () =>
+  console.log(`Server running on http://localhost:${PORT}`)
+);
