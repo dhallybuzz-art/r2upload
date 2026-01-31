@@ -4,8 +4,10 @@ const { S3Client } = require('@aws-sdk/client-s3');
 const { Upload } = require('@aws-sdk/lib-storage');
 const stream = require('stream');
 
-const uploadQueue = new Queue('upload-task', process.env.REDIS_URL);
+// Redis Connection (Heroku REDIS_URL ব্যবহার করবে)
+const uploadQueue = new Queue('r2-upload-tasks', process.env.REDIS_URL);
 
+// R2 Client Setup
 const s3Client = new S3Client({
     region: "auto",
     endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -16,29 +18,43 @@ const s3Client = new S3Client({
 });
 
 uploadQueue.process(async (job) => {
-    const { fileId, fileName } = job.data;
-    console.log(`Worker processing: ${fileName}`);
+    const { fileId, fileName, contentType } = job.data;
+    console.log(`Worker starting: ${fileName}`);
 
     try {
         const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
-        const response = await axios({ method: 'get', url: gDriveUrl, responseType: 'stream' });
+        
+        // ১. গুগল ড্রাইভ থেকে ডাটা স্ট্রিম করা
+        const response = await axios({
+            method: 'get',
+            url: gDriveUrl,
+            responseType: 'stream',
+            timeout: 0 // বড় ফাইলের জন্য আনলিমিটেড সময়
+        });
 
+        // ২. R2-তে স্ট্রিম সরাসরি আপলোড (Multipart Upload)
         const upload = new Upload({
             client: s3Client,
             params: {
                 Bucket: process.env.R2_BUCKET_NAME,
                 Key: fileName,
                 Body: response.data.pipe(new stream.PassThrough()),
+                ContentType: contentType || 'video/x-matroska',
                 ContentDisposition: `attachment; filename="${fileName}"`
             },
-            partSize: 10 * 1024 * 1024, // 10MB parts
-            queueSize: 1 
+            queueSize: 1, // Heroku-র কম র‍্যামের জন্য ১টি করে পার্ট আপলোড হবে
+            partSize: 10 * 1024 * 1024 // ১০ মেগাবাইট করে পার্ট হবে
+        });
+
+        upload.on('httpUploadProgress', (progress) => {
+            console.log(`Uploading ${fileName}: ${Math.round((progress.loaded / 1024 / 1024))} MB uploaded`);
         });
 
         await upload.done();
-        console.log(`Worker finished: ${fileName}`);
+        console.log(`✅ Successfully uploaded: ${fileName}`);
+
     } catch (err) {
-        console.error(`Worker error: ${err.message}`);
-        throw err; // এটি কিউ-কে রিট্রাই করতে বলবে
+        console.error(`❌ Worker Error for ${fileName}:`, err.response ? `${err.response.status} - ${err.response.statusText}` : err.message);
+        throw err; // এটি কিউকে পুনরায় চেষ্টার সুযোগ দেবে
     }
 });
