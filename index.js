@@ -62,8 +62,8 @@ app.get('/:fileId', async (req, res) => {
                             ContentType: 'video/x-matroska',
                             ContentDisposition: `attachment; filename="${fileName}"`
                         },
-                        queueSize: 1, // Heroku র‍্যাম বাঁচাবে 
-                        partSize: 10 * 1024 * 1024 // 10MB চাঙ্ক 
+                        queueSize: 2, // Heroku র‍্যাম বাঁচাবে 
+                        partSize: 50 * 1024 * 1024 // 10MB চাঙ্ক 
                     });
                     await upload.done();
                 } catch (err) {
@@ -78,3 +78,4 @@ app.get('/:fileId', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Running on ${PORT}`));
+
