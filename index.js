@@ -23,13 +23,13 @@ app.get('/favicon.ico', (req, res) => res.status(204).end());
 
 app.get('/:fileId', async (req, res) => {
     const fileId = req.params.fileId;
-    if (!fileId || fileId.length < 15) {
-        return res.status(400).json({ status: "error", message: "Invalid Google Drive ID" });
-    }
+    if (!fileId || fileId.length < 15) return res.status(400).json({ status: "error", message: "Invalid ID" });
 
     try {
         // ১. Google Drive Metadata সংগ্রহ
-        const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size,mimeType&key=${process.env.GDRIVE_API_KEY}`;
+        const apiKey = process.env.GDRIVE_API_KEY;
+        const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size,mimeType&key=${apiKey}`;
+        
         let fileName, fileSize, mimeType;
 
         try {
@@ -38,17 +38,16 @@ app.get('/:fileId', async (req, res) => {
             fileSize = parseInt(metaResponse.data.size) || 0;
             mimeType = metaResponse.data.mimeType;
         } catch (e) {
-            console.error("Meta Fetch Error:", e.response ? e.response.data : e.message);
-            return res.status(500).json({ status: "error", message: "Could not fetch metadata from Google Drive. Check API Key or File Permissions." });
+            console.error("Meta Fetch Error:", e.message);
+            return res.status(403).json({ status: "error", message: "Google Drive API access denied. Check API Key and File Permissions." });
         }
 
         const r2Key = fileName;
-        const encodedKey = encodeURIComponent(r2Key);
-        const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${encodedKey}`;
+        const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${encodeURIComponent(r2Key)}`;
 
-        // ২. R2 বাকেটে ফাইলটি আগে থেকে আছে কিনা চেক করা
+        // ২. R2 চেক
         try {
-            const headData = await s3Client.send(new HeadObjectCommand({
+            await s3Client.send(new HeadObjectCommand({
                 Bucket: process.env.R2_BUCKET_NAME,
                 Key: r2Key
             }));
@@ -56,21 +55,19 @@ app.get('/:fileId', async (req, res) => {
             return res.json({
                 status: "success",
                 filename: fileName,
-                size: headData.ContentLength || fileSize,
+                size: fileSize,
                 url: r2PublicUrl
             });
-        } catch (e) { 
-            // ফাইল নেই, তাই আপলোড শুরু করতে হবে
-        }
+        } catch (e) { /* ফাইল নেই, আপলোড করতে হবে */ }
 
-        // ৩. ব্যাকগ্রাউন্ড আপলোড লজিক
+        // ৩. ব্যাকগ্রাউন্ড আপলোড (Bypass Virus Warning লজিকসহ)
         if (!activeUploads.has(fileId)) {
             const startUpload = async () => {
                 activeUploads.add(fileId);
-                console.log(`Starting background upload for: ${fileName}`);
-                
+                console.log(`Starting transfer for: ${fileName}`);
                 try {
-                    const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
+                    // বড় ফাইলের ভাইরাস স্ক্যান ওয়ার্নিং বাইপাস করতে confirm=t যোগ করা হয়েছে
+                    const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${apiKey}&confirm=t`;
                     
                     const response = await axios({
                         method: 'get',
@@ -78,7 +75,10 @@ app.get('/:fileId', async (req, res) => {
                         responseType: 'stream',
                         timeout: 0,
                         maxContentLength: Infinity,
-                        maxBodyLength: Infinity
+                        maxBodyLength: Infinity,
+                        headers: {
+                            'User-Agent': 'Mozilla/5.0' // ব্রাউজার হিসেবে রিকোয়েস্ট পাঠানো
+                        }
                     });
 
                     const upload = new Upload({
@@ -95,27 +95,25 @@ app.get('/:fileId', async (req, res) => {
                     });
 
                     await upload.done();
-                    console.log(`Upload Complete: ${fileName}`);
+                    console.log(`Successfully finished: ${fileName}`);
                 } catch (err) {
-                    console.error(`Upload failed for ${fileName}:`, err.response ? err.response.data : err.message);
+                    console.error(`Upload error for ${fileId}:`, err.message);
                 } finally {
                     activeUploads.delete(fileId);
                 }
             };
-            
-            startUpload(); // Background processing
+            startUpload();
         }
 
         res.json({
             status: "processing",
             filename: fileName,
-            message: "File is being transferred from Google Drive to R2. Please refresh in a few minutes.",
-            progress: "Transferring"
+            message: "Transfer started from GDrive to R2. Please wait and refresh.",
+            progress: "Running"
         });
 
     } catch (error) {
-        console.error("Global Error:", error.message);
-        res.status(500).json({ status: "error", message: "Internal Server Error" });
+        res.json({ status: "error", message: error.message });
     }
 });
 
