@@ -7,7 +7,7 @@ const { Upload } = require("@aws-sdk/lib-storage");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* ---------- Cloudflare R2 ---------- */
+/* ---------- R2 ---------- */
 const s3 = new S3Client({
   region: "auto",
   endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -17,74 +17,65 @@ const s3 = new S3Client({
   },
 });
 
-const uploading = new Set();
+const active = new Set();
 
-/* ---------- Utils ---------- */
-function safeName(name) {
-  return name.replace(/[^\w.\-()]/g, "_");
-}
+const safe = (n) => n.replace(/[^\w.\-()]/g, "_");
 
-/* ---------- Routes ---------- */
-app.get("/favicon.ico", (_, res) => res.sendStatus(204));
+app.get("/:id", async (req, res) => {
+  const id = req.params.id;
+  if (!id || id.length < 15)
+    return res.status(400).json({ error: "Invalid ID" });
 
-app.get("/:fileId", async (req, res) => {
-  const fileId = req.params.fileId;
-  if (!fileId || fileId.length < 15)
-    return res.status(400).json({ error: "Invalid File ID" });
+  let fileName = `file_${id}.bin`;
+  let size = 0;
 
-  let fileName = `file_${fileId}`;
-  let fileSize = 0;
-
-  /* ---------- 1. Get metadata ---------- */
+  /* ---------- Metadata (optional) ---------- */
   try {
     const meta = await axios.get(
-      `https://www.googleapis.com/drive/v3/files/${fileId}`,
+      `https://www.googleapis.com/drive/v3/files/${id}`,
       {
         params: {
-          fields: "name,size,mimeType",
+          fields: "name,size",
           key: process.env.GDRIVE_API_KEY,
         },
       }
     );
-
-    fileName = safeName(meta.data.name || fileName);
-    fileSize = Number(meta.data.size || 0);
-  } catch {
-    fileName += ".bin";
-  }
+    fileName = safe(meta.data.name || fileName);
+    size = Number(meta.data.size || 0);
+  } catch (_) {}
 
   const r2Key = fileName;
   const publicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${encodeURIComponent(
     r2Key
   )}`;
 
-  /* ---------- 2. Already exists? ---------- */
+  /* ---------- Already uploaded ---------- */
   try {
-    const head = await s3.send(
+    const h = await s3.send(
       new HeadObjectCommand({
         Bucket: process.env.R2_BUCKET_NAME,
         Key: r2Key,
       })
     );
-
     return res.json({
       status: "ready",
       filename: r2Key,
-      size: head.ContentLength,
+      size: h.ContentLength,
       url: publicUrl,
     });
   } catch (_) {}
 
-  /* ---------- 3. Start upload ---------- */
-  if (!uploading.has(fileId)) {
-    uploading.add(fileId);
+  /* ---------- Upload ---------- */
+  if (!active.has(id)) {
+    active.add(id);
 
     (async () => {
       try {
-        const gdriveStream = await axios({
+        const downloadUrl = `https://drive.usercontent.google.com/download?id=${id}&export=download&confirm=t`;
+
+        const gstream = await axios({
           method: "GET",
-          url: `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
-          params: { key: process.env.GDRIVE_API_KEY },
+          url: downloadUrl,
           responseType: "stream",
           timeout: 0,
         });
@@ -94,9 +85,9 @@ app.get("/:fileId", async (req, res) => {
           params: {
             Bucket: process.env.R2_BUCKET_NAME,
             Key: r2Key,
-            Body: gdriveStream.data.pipe(new stream.PassThrough()),
+            Body: gstream.data.pipe(new stream.PassThrough()),
             ContentType:
-              gdriveStream.headers["content-type"] ||
+              gstream.headers["content-type"] ||
               "application/octet-stream",
             ContentDisposition: `attachment; filename="${r2Key}"`,
           },
@@ -106,10 +97,10 @@ app.get("/:fileId", async (req, res) => {
 
         await upload.done();
         console.log("Uploaded:", r2Key);
-      } catch (err) {
-        console.error("Upload failed:", err.message);
+      } catch (e) {
+        console.error("UPLOAD ERROR:", e.message);
       } finally {
-        uploading.delete(fileId);
+        active.delete(id);
       }
     })();
   }
@@ -121,7 +112,6 @@ app.get("/:fileId", async (req, res) => {
   });
 });
 
-/* ---------- Start ---------- */
 app.listen(PORT, () =>
-  console.log(`Server running on http://localhost:${PORT}`)
+  console.log(`Server running on port ${PORT}`)
 );
