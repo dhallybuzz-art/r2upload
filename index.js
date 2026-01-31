@@ -20,35 +20,37 @@ const activeUploads = new Set();
 
 app.get('/:fileId', async (req, res) => {
     const fileId = req.params.fileId;
-    if (!fileId || fileId.length < 15) return res.status(400).json({ status: "error" });
+    const apiKey = process.env.GDRIVE_API_KEY;
 
     try {
-        // ১. মেটাডাটা সংগ্রহ
-        const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size&key=${process.env.GDRIVE_API_KEY}`;
-        let fileName = `Movie_${fileId}.mkv`, fileSize = 0;
+        // ১. মেটাডাটা ও পাবলিক চেক
+        const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size&key=${apiKey}`;
+        let fileName, fileSize;
 
         try {
             const meta = await axios.get(metaUrl);
             fileName = meta.data.name;
-            fileSize = parseInt(meta.data.size) || 0;
-        } catch (e) { console.error("Metadata Fetch Failed!"); }
+            fileSize = meta.data.size;
+        } catch (e) {
+            return res.json({ status: "error", message: "API Key invalid or File not public enough." });
+        }
 
         const r2Key = fileName;
-        const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${encodeURIComponent(r2Key)}`;
+        const encodedKey = encodeURIComponent(r2Key);
+        const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${encodedKey}`;
 
-        // ২. বাকেটে চেক
+        // ২. R2 চেক
         try {
-            const head = await s3Client.send(new HeadObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: r2Key }));
-            return res.json({ status: "success", filename: fileName, size: head.ContentLength || fileSize, url: r2PublicUrl, r2_key: r2Key });
+            await s3Client.send(new HeadObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: r2Key }));
+            return res.json({ status: "success", filename: fileName, size: fileSize, url: r2PublicUrl });
         } catch (e) {}
 
-        // ৩. আপলোড প্রসেস
+        // ৩. আপলোড (অবশ্যই queueSize ১ রাখুন)
         if (!activeUploads.has(fileId)) {
             const startUpload = async () => {
                 activeUploads.add(fileId);
-                console.log(`Starting transfer for: ${fileName}`);
                 try {
-                    const gUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
+                    const gUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${apiKey}`;
                     const resp = await axios({ method: 'get', url: gUrl, responseType: 'stream' });
 
                     const upload = new Upload({
@@ -60,19 +62,19 @@ app.get('/:fileId', async (req, res) => {
                             ContentType: 'video/x-matroska',
                             ContentDisposition: `attachment; filename="${fileName}"`
                         },
-                        queueSize: 1, // RAM সাশ্রয়ী
-                        partSize: 10 * 1024 * 1024 // 10MB চাঙ্ক
+                        queueSize: 1, // Heroku র‍্যাম বাঁচাবে 
+                        partSize: 10 * 1024 * 1024 // 10MB চাঙ্ক 
                     });
                     await upload.done();
-                    console.log(`Success: ${fileName}`);
-                } catch (err) { 
-                    console.error(`Upload error for ${fileId}: ${err.message}`); 
+                } catch (err) {
+                    console.error("Critical: Google blocked the transfer.");
                 } finally { activeUploads.delete(fileId); }
             };
             startUpload();
         }
-        res.json({ status: "processing", filename: fileName, message: "Transfer started..." });
-    } catch (error) { res.json({ status: "processing" }); }
+
+        res.json({ status: "processing", filename: fileName });
+    } catch (error) { res.json({ status: "error" }); }
 });
 
-app.listen(PORT, () => console.log(`Active on port ${PORT}`));
+app.listen(PORT, () => console.log(`Running on ${PORT}`));
