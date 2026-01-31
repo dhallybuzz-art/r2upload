@@ -7,7 +7,7 @@ const { Upload } = require("@aws-sdk/lib-storage");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* ---------- R2 ---------- */
+/* ---------- Cloudflare R2 ---------- */
 const s3 = new S3Client({
   region: "auto",
   endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -17,19 +17,35 @@ const s3 = new S3Client({
   },
 });
 
+/* ---------- In-memory upload lock ---------- */
 const active = new Set();
 
-const safe = (n) => n.replace(/[^\w.\-()]/g, "_");
+/* ---------- Utils ---------- */
+const safeName = (name) => name.replace(/[^\w.\-()]/g, "_");
 
+const formatSize = (bytes) => {
+  if (!bytes || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  return (bytes / Math.pow(1024, i)).toFixed(2) + " " + units[i];
+};
+
+/* ---------- Fix favicon 400 ---------- */
+app.get("/favicon.ico", (req, res) => {
+  res.status(204).end();
+});
+
+/* ---------- Main Route ---------- */
 app.get("/:id", async (req, res) => {
   const id = req.params.id;
-  if (!id || id.length < 15)
-    return res.status(400).json({ error: "Invalid ID" });
+  if (!id || id.length < 15) {
+    return res.status(400).json({ error: "Invalid File ID" });
+  }
 
   let fileName = `file_${id}.bin`;
-  let size = 0;
+  let gdriveSize = 0;
 
-  /* ---------- Metadata (optional) ---------- */
+  /* ---------- Google Drive metadata ---------- */
   try {
     const meta = await axios.get(
       `https://www.googleapis.com/drive/v3/files/${id}`,
@@ -40,32 +56,44 @@ app.get("/:id", async (req, res) => {
         },
       }
     );
-    fileName = safe(meta.data.name || fileName);
-    size = Number(meta.data.size || 0);
-  } catch (_) {}
+
+    fileName = safeName(meta.data.name || fileName);
+    gdriveSize = Number(meta.data.size || 0);
+  } catch (_) {
+    // metadata optional
+  }
 
   const r2Key = fileName;
   const publicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${encodeURIComponent(
     r2Key
   )}`;
 
-  /* ---------- Already uploaded ---------- */
+  /* ---------- Check R2 ---------- */
   try {
-    const h = await s3.send(
+    const head = await s3.send(
       new HeadObjectCommand({
         Bucket: process.env.R2_BUCKET_NAME,
         Key: r2Key,
       })
     );
+
+    const realSize =
+      head.ContentLength && head.ContentLength > 1024 * 1024
+        ? head.ContentLength
+        : gdriveSize;
+
     return res.json({
       status: "ready",
       filename: r2Key,
-      size: h.ContentLength,
+      size: realSize,
+      size_human: formatSize(realSize),
       url: publicUrl,
     });
-  } catch (_) {}
+  } catch (_) {
+    // file not found → continue
+  }
 
-  /* ---------- Upload ---------- */
+  /* ---------- Start upload (background) ---------- */
   if (!active.has(id)) {
     active.add(id);
 
@@ -92,26 +120,29 @@ app.get("/:id", async (req, res) => {
             ContentDisposition: `attachment; filename="${r2Key}"`,
           },
           queueSize: 4,
-          partSize: 10 * 1024 * 1024,
+          partSize: 10 * 1024 * 1024, // 10MB
         });
 
         await upload.done();
         console.log("Uploaded:", r2Key);
-      } catch (e) {
-        console.error("UPLOAD ERROR:", e.message);
+      } catch (err) {
+        console.error("UPLOAD ERROR:", err.message);
       } finally {
         active.delete(id);
       }
     })();
   }
 
-  res.json({
+  return res.json({
     status: "processing",
     filename: r2Key,
-    message: "Upload started. Refresh later.",
+    size: gdriveSize,
+    size_human: formatSize(gdriveSize),
+    message: "Upload started. Please refresh after some time.",
   });
 });
 
-app.listen(PORT, () =>
-  console.log(`Server running on port ${PORT}`)
-);
+/* ---------- Start server ---------- */
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
