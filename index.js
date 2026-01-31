@@ -7,6 +7,7 @@ const stream = require('stream');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Cloudflare R2 Client Configuration
 const s3Client = new S3Client({
     region: "auto",
     endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -22,28 +23,30 @@ app.get('/favicon.ico', (req, res) => res.status(204).end());
 
 app.get('/:fileId', async (req, res) => {
     const fileId = req.params.fileId;
-    if (!fileId || fileId.length < 15) return res.status(400).json({ status: "error", message: "Invalid ID" });
+    if (!fileId || fileId.length < 15) {
+        return res.status(400).json({ status: "error", message: "Invalid Google Drive ID" });
+    }
 
     try {
-        // ১. Google Drive Metadata সংগ্রহ (আসল নাম উদ্ধার)
-        const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size&key=${process.env.GDRIVE_API_KEY}`;
-        let fileName = `Movie_${fileId}.mkv`; 
-        let fileSize = 0;
+        // ১. Google Drive Metadata সংগ্রহ
+        const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size,mimeType&key=${process.env.GDRIVE_API_KEY}`;
+        let fileName, fileSize, mimeType;
 
         try {
             const metaResponse = await axios.get(metaUrl);
-            fileName = metaResponse.data.name; 
+            fileName = metaResponse.data.name;
             fileSize = parseInt(metaResponse.data.size) || 0;
+            mimeType = metaResponse.data.mimeType;
         } catch (e) {
-            console.error("Meta Fetch Error:", e.message);
+            console.error("Meta Fetch Error:", e.response ? e.response.data : e.message);
+            return res.status(500).json({ status: "error", message: "Could not fetch metadata from Google Drive. Check API Key or File Permissions." });
         }
 
-        // ২. বাকেট Key নির্ধারণ (এখন আসল নামেই R2 তে সেভ হবে)
-        const r2Key = fileName; 
-        const encodedKey = encodeURIComponent(r2Key); // URL-এর জন্য নাম এনকোড করা
+        const r2Key = fileName;
+        const encodedKey = encodeURIComponent(r2Key);
         const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${encodedKey}`;
 
-        // ৩. R2 চেক
+        // ২. R2 বাকেটে ফাইলটি আগে থেকে আছে কিনা চেক করা
         try {
             const headData = await s3Client.send(new HeadObjectCommand({
                 Bucket: process.env.R2_BUCKET_NAME,
@@ -54,56 +57,66 @@ app.get('/:fileId', async (req, res) => {
                 status: "success",
                 filename: fileName,
                 size: headData.ContentLength || fileSize,
-                url: r2PublicUrl,
-                r2_key: r2Key 
+                url: r2PublicUrl
             });
-        } catch (e) { /* ফাইল নেই */ }
+        } catch (e) { 
+            // ফাইল নেই, তাই আপলোড শুরু করতে হবে
+        }
 
-        // ৪. ব্যাকগ্রাউন্ড আপলোড (আসল নাম এবং হেডারসহ)
+        // ৩. ব্যাকগ্রাউন্ড আপলোড লজিক
         if (!activeUploads.has(fileId)) {
             const startUpload = async () => {
                 activeUploads.add(fileId);
-                console.log(`Starting upload for: ${fileName}`);
+                console.log(`Starting background upload for: ${fileName}`);
+                
                 try {
                     const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
-                    const response = await axios({ method: 'get', url: gDriveUrl, responseType: 'stream', timeout: 0 });
+                    
+                    const response = await axios({
+                        method: 'get',
+                        url: gDriveUrl,
+                        responseType: 'stream',
+                        timeout: 0,
+                        maxContentLength: Infinity,
+                        maxBodyLength: Infinity
+                    });
 
                     const upload = new Upload({
                         client: s3Client,
                         params: {
                             Bucket: process.env.R2_BUCKET_NAME,
-                            Key: r2Key, // R2-তে এই নামেই ফাইলটি জমা হবে
+                            Key: r2Key,
                             Body: response.data.pipe(new stream.PassThrough()),
-                            ContentType: response.headers['content-type'] || 'video/x-matroska',
-                            // এটি ডাউনলোডের সময় আসল নাম নিশ্চিত করবে
-                            ContentDisposition: `attachment; filename="${fileName}"`
+                            ContentType: mimeType || 'video/x-matroska',
+                            ContentDisposition: `attachment; filename="${encodeURIComponent(fileName)}"`
                         },
-                        queueSize: 4, 
-                        partSize: 1024 * 1024 * 10
+                        queueSize: 4,
+                        partSize: 10 * 1024 * 1024 // 10MB parts
                     });
 
                     await upload.done();
-                    console.log(`Successfully finished: ${fileName}`);
+                    console.log(`Upload Complete: ${fileName}`);
                 } catch (err) {
-                    console.error(`Upload error:`, err.message);
+                    console.error(`Upload failed for ${fileName}:`, err.response ? err.response.data : err.message);
                 } finally {
                     activeUploads.delete(fileId);
                 }
             };
-            startUpload();
+            
+            startUpload(); // Background processing
         }
 
         res.json({
             status: "processing",
             filename: fileName,
-            message: "Upload started with original filename. Please wait.",
-            progress: "Running"
+            message: "File is being transferred from Google Drive to R2. Please refresh in a few minutes.",
+            progress: "Transferring"
         });
 
     } catch (error) {
-        res.json({ status: "processing", message: "Initialing..." });
+        console.error("Global Error:", error.message);
+        res.status(500).json({ status: "error", message: "Internal Server Error" });
     }
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
