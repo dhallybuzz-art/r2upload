@@ -42,8 +42,8 @@ uploadQueue.process(async (job) => {
                 ContentType: contentType || 'video/x-matroska',
                 ContentDisposition: `attachment; filename="${fileName}"`
             },
-            queueSize: 1, // Heroku-র কম র‍্যামের জন্য ১টি করে পার্ট আপলোড হবে
-            partSize: 10 * 1024 * 1024 // ১০ মেগাবাইট করে পার্ট হবে
+            queueSize: 5, // Heroku-র কম র‍্যামের জন্য ১টি করে পার্ট আপলোড হবে
+            partSize: 20 * 1024 * 1024 // ১০ মেগাবাইট করে পার্ট হবে
         });
 
         upload.on('httpUploadProgress', (progress) => {
@@ -58,3 +58,4 @@ uploadQueue.process(async (job) => {
         throw err; // এটি কিউকে পুনরায় চেষ্টার সুযোগ দেবে
     }
 });
+
