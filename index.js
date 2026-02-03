@@ -25,29 +25,43 @@ app.get('/:fileId', async (req, res) => {
     if (!fileId || fileId.length < 15) return res.status(400).json({ status: "error", message: "Invalid ID" });
 
     try {
-        // ১. Google Drive Metadata সংগ্রহ (আসল নাম এবং সাইজ উদ্ধার)
-        const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size&key=${process.env.GDRIVE_API_KEY}`;
-        let fileName = `Movie_${fileId}.mkv`; // Default fallback name
+        let fileName = "";
         let fileSize = 0;
+        const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
 
+        // ১. প্রথম চেষ্টা: Google Drive API মেটাডেটা থেকে নাম সংগ্রহ
         try {
+            const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size&key=${process.env.GDRIVE_API_KEY}`;
             const metaResponse = await axios.get(metaUrl);
-            if (metaResponse.data.name) {
-                fileName = metaResponse.data.name; 
-                fileSize = parseInt(metaResponse.data.size) || 0;
-                console.log(`Fetched original name: ${fileName}`);
-            }
+            fileName = metaResponse.data.name;
+            fileSize = parseInt(metaResponse.data.size) || 0;
         } catch (e) {
-            // যদি 404 আসে, তার মানে ফাইলটি পাবলিক নয় অথবা API কী-তে সমস্যা আছে
-            console.error(`Meta Fetch Error for ${fileId}:`, e.message);
+            console.error(`Meta API failed for ${fileId}, trying Header method...`);
+            
+            // ২. বিকল্প পদ্ধতি: সরাসরি ডাউনলোড লিঙ্ক থেকে Headers চেক করা
+            try {
+                const headResponse = await axios.head(gDriveUrl);
+                const contentDisp = headResponse.headers['content-disposition'];
+                if (contentDisp && contentDisp.includes('filename=')) {
+                    // filename="example.mkv" থেকে নাম বের করা
+                    fileName = contentDisp.split('filename=')[1].replace(/['"]/g, '');
+                }
+                fileSize = parseInt(headResponse.headers['content-length']) || 0;
+            } catch (headErr) {
+                console.error(`Header method also failed:`, headErr.message);
+            }
         }
 
-        // ২. বাকেট Key এবং পাবলিক URL নির্ধারণ
-        const r2Key = fileName; 
+        // যদি কোনোভাবেই নাম না পাওয়া যায়, তবেই কেবল আইডি ব্যবহার হবে (নিরাপত্তার জন্য)
+        if (!fileName) {
+            fileName = `File_${fileId}.mkv`;
+        }
+
+        const r2Key = fileName;
         const encodedKey = encodeURIComponent(r2Key);
         const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${encodedKey}`;
 
-        // ৩. R2-তে ফাইলটি ইতিমধ্যে আছে কি না চেক করা
+        // ৩. R2 চেক
         try {
             const headData = await s3Client.send(new HeadObjectCommand({
                 Bucket: process.env.R2_BUCKET_NAME,
@@ -58,26 +72,19 @@ app.get('/:fileId', async (req, res) => {
                 status: "success",
                 filename: fileName,
                 size: headData.ContentLength || fileSize,
-                url: r2PublicUrl,
-                r2_key: r2Key 
+                url: r2PublicUrl
             });
-        } catch (e) { 
-            // ফাইল R2 তে নেই, আপলোড শুরু করতে হবে
-        }
+        } catch (e) { /* ফাইল নেই */ }
 
-        // ৪. ব্যাকগ্রাউন্ড আপলোড (যদি অলরেডি প্রসেসিং-এ না থাকে)
+        // ৪. ব্যাকগ্রাউন্ড আপলোড
         if (!activeUploads.has(fileId)) {
             const startUpload = async () => {
                 activeUploads.add(fileId);
-                console.log(`Starting upload to R2: ${fileName}`);
                 try {
-                    const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
-                    const response = await axios({ 
-                        method: 'get', 
-                        url: gDriveUrl, 
-                        responseType: 'stream', 
-                        timeout: 0 
-                    });
+                    const response = await axios({ method: 'get', url: gDriveUrl, responseType: 'stream', timeout: 0 });
+
+                    // যদি শুরুতে নাম না পাওয়া যেত, তবে ডাউনলোড স্ট্রিম থেকেও নাম নেওয়া সম্ভব
+                    const finalFileName = fileName;
 
                     const upload = new Upload({
                         client: s3Client,
@@ -86,16 +93,16 @@ app.get('/:fileId', async (req, res) => {
                             Key: r2Key,
                             Body: response.data.pipe(new stream.PassThrough()),
                             ContentType: response.headers['content-type'] || 'video/x-matroska',
-                            ContentDisposition: `attachment; filename="${fileName}"`
+                            ContentDisposition: `attachment; filename="${finalFileName}"`
                         },
-                        queueSize: 5, 
-                        partSize: 1024 * 1024 * 20 // 20MB parts
+                        queueSize: 5,
+                        partSize: 1024 * 1024 * 20
                     });
 
                     await upload.done();
-                    console.log(`Successfully uploaded to R2: ${fileName}`);
+                    console.log(`Successfully finished: ${finalFileName}`);
                 } catch (err) {
-                    console.error(`Upload failed for ${fileName}:`, err.message);
+                    console.error(`Upload error:`, err.message);
                 } finally {
                     activeUploads.delete(fileId);
                 }
@@ -106,13 +113,12 @@ app.get('/:fileId', async (req, res) => {
         res.json({
             status: "processing",
             filename: fileName,
-            message: "File found and upload started. Please check back in a moment.",
+            message: "Fetching file and starting upload...",
             progress: "Running"
         });
 
     } catch (error) {
-        console.error("General Error:", error.message);
-        res.status(500).json({ status: "error", message: "Internal server error" });
+        res.json({ status: "error", message: "Something went wrong" });
     }
 });
 
