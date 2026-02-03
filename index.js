@@ -55,7 +55,7 @@ const processQueue = async () => {
                 ContentDisposition: `attachment; filename="${fileName}"`
             },
             queueSize: 10, 
-            partSize: 1024 * 1024 * 10 // 10MB parts
+            partSize: 1024 * 1024 * 20 // 10MB parts
         });
 
         await upload.done();
@@ -158,3 +158,4 @@ app.get('/:fileId', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
