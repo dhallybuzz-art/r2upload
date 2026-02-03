@@ -28,62 +28,71 @@ app.get('/:fileId', async (req, res) => {
         let fileName = "";
         let fileSize = 0;
 
-        // ১. প্রথম চেষ্টা: Google Drive Meta API
+        // ১. প্রথম চেষ্টা: Google Drive API
         try {
             const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size&key=${process.env.GDRIVE_API_KEY}`;
             const metaResponse = await axios.get(metaUrl);
             fileName = metaResponse.data.name;
             fileSize = parseInt(metaResponse.data.size) || 0;
         } catch (e) {
-            console.error(`Meta API failed for ${fileId}, trying Page Scraping method...`);
+            console.log(`Meta API failed for ${fileId}, trying Scraping...`);
             
-            // ২. দ্বিতীয় চেষ্টা (বিকল্প): Google Drive Preview Page থেকে নাম বের করা
+            // ২. দ্বিতীয় চেষ্টা: Scraping (আপনার লগে এটি সফল হয়েছে)
             try {
                 const previewUrl = `https://drive.google.com/file/d/${fileId}/view`;
                 const response = await axios.get(previewUrl, { 
-                    headers: { 'User-Agent': 'Mozilla/5.0' } 
+                    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' } 
                 });
-                // HTML থেকে টাইটেল ট্যাগ বা নির্দিষ্ট প্যাটার্ন দিয়ে নাম খোঁজা
                 const match = response.data.match(/<title>(.*?) - Google Drive<\/title>/);
                 if (match && match[1]) {
                     fileName = match[1].trim();
-                    console.log(`Found name via Scraping: ${fileName}`);
+                    console.log(`Success via Scraping: ${fileName}`);
                 }
             } catch (scrapErr) {
-                console.error(`Scraping method also failed.`);
+                console.error(`Scraping also failed.`);
             }
         }
 
-        // যদি কোনোভাবেই নাম না পাওয়া যায়, তবেই শেষ ভরসা আইডি
+        const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
+
+        // ৩. তৃতীয় চেষ্টা: যদি নাম এখনো খালি থাকে, তবে সরাসরি স্ট্রীম হেডার চেক করা
+        if (!fileName) {
+            try {
+                const headRes = await axios.head(gDriveUrl);
+                const cd = headRes.headers['content-disposition'];
+                if (cd && cd.includes('filename=')) {
+                    fileName = cd.split('filename=')[1].replace(/['"]/g, '');
+                }
+            } catch (hErr) { /* fallback to id */ }
+        }
+
+        // সব ব্যর্থ হলে আইডি ব্যবহার
         if (!fileName) fileName = `Movie_${fileId}.mkv`;
 
-        const r2Key = fileName; 
-        const encodedKey = encodeURIComponent(r2Key);
-        const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${encodedKey}`;
+        const r2Key = fileName;
+        const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${encodeURIComponent(r2Key)}`;
 
-        // ৩. R2 চেক
+        // R2 তে ফাইল আছে কি না চেক
         try {
             const headData = await s3Client.send(new HeadObjectCommand({
                 Bucket: process.env.R2_BUCKET_NAME,
                 Key: r2Key
             }));
-            
             return res.json({
                 status: "success",
                 filename: fileName,
                 size: headData.ContentLength || fileSize,
                 url: r2PublicUrl
             });
-        } catch (e) { /* ফাইল নেই */ }
+        } catch (e) { /* ফাইল নেই, আপলোড শুরু হবে */ }
 
-        // ৪. ব্যাকগ্রাউন্ড আপলোড
+        // আপলোড প্রসেস
         if (!activeUploads.has(fileId)) {
             const startUpload = async () => {
                 activeUploads.add(fileId);
                 try {
-                    const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
                     const response = await axios({ method: 'get', url: gDriveUrl, responseType: 'stream', timeout: 0 });
-
+                    
                     const upload = new Upload({
                         client: s3Client,
                         params: {
@@ -93,12 +102,12 @@ app.get('/:fileId', async (req, res) => {
                             ContentType: response.headers['content-type'] || 'video/x-matroska',
                             ContentDisposition: `attachment; filename="${fileName}"`
                         },
-                        queueSize: 5, 
-                        partSize: 1024 * 1024 * 20
+                        queueSize: 10, // স্পিড বাড়ানোর জন্য বাড়ানো হয়েছে
+                        partSize: 1024 * 1024 * 10 // 10MB parts
                     });
 
                     await upload.done();
-                    console.log(`Successfully finished: ${fileName}`);
+                    console.log(`Upload Complete: ${fileName}`);
                 } catch (err) {
                     console.error(`Upload error:`, err.message);
                 } finally {
@@ -111,12 +120,12 @@ app.get('/:fileId', async (req, res) => {
         res.json({
             status: "processing",
             filename: fileName,
-            message: "Naming fixed and upload started.",
+            message: "Naming secured. Background upload is running.",
             progress: "Running"
         });
 
     } catch (error) {
-        res.json({ status: "processing", message: "Working..." });
+        res.json({ status: "processing", message: "Starting stream..." });
     }
 });
 
