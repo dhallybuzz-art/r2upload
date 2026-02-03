@@ -78,8 +78,8 @@ app.get('/:fileId', async (req, res) => {
                             // এটি ডাউনলোডের সময় আসল নাম নিশ্চিত করবে
                             ContentDisposition: `attachment; filename="${fileName}"`
                         },
-                        queueSize: 4, 
-                        partSize: 1024 * 1024 * 10
+                        queueSize: 5, 
+                        partSize: 1024 * 1024 * 20
                     });
 
                     await upload.done();
@@ -106,4 +106,5 @@ app.get('/:fileId', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
 
