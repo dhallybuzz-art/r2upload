@@ -54,7 +54,7 @@ const processQueue = async () => {
                 ContentType: response.headers['content-type'] || 'video/x-matroska',
                 ContentDisposition: `attachment; filename="${fileName}"`
             },
-            queueSize: 10, 
+            queueSize: 5, 
             partSize: 1024 * 1024 * 20 // 10MB parts
         });
 
@@ -158,4 +158,5 @@ app.get('/:fileId', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
 
