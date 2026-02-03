@@ -16,22 +16,21 @@ const s3Client = new S3Client({
     },
 });
 
-// --- কনকারেন্সি কন্ট্রোল ভেরিয়েবল ---
-const MAX_CONCURRENT_UPLOADS = 5; // সর্বোচ্চ ৫টি ফাইল
-let runningUploads = 0;           // বর্তমানে কতটি চলছে
-const uploadQueue = [];           // অপেক্ষমান ফাইলের তালিকা
-const activeUploads = new Set();  // কিউ বা রানিং অবস্থায় থাকা ফাইল আইডি
+// --- কনকারেন্সি কন্ট্রোল ভেরিয়েবল ---
+const MAX_CONCURRENT_UPLOADS = 5; // সর্বোচ্চ ৫টি ফাইল 
+let runningUploads = 0;           // বর্তমানে কতটি চলছে 
+const uploadQueue = [];           // অপেক্ষমান ফাইলের তালিকা 
+const activeUploads = new Set();  // একটি ফাইল আইডি একবারই প্রসেস করতে 
 
 app.get('/favicon.ico', (req, res) => res.status(204).end());
 
 // --- কিউ প্রসেস করার ফাংশন ---
 const processQueue = async () => {
-    // যদি স্লট খালি থাকে এবং কিউতে ফাইল থাকে
     if (runningUploads >= MAX_CONCURRENT_UPLOADS || uploadQueue.length === 0) {
         return;
     }
 
-    const task = uploadQueue.shift(); // কিউ থেকে প্রথম ফাইলটি নেওয়া
+    const task = uploadQueue.shift(); 
     runningUploads++;
     
     const { fileId, fileName, r2Key, gDriveUrl } = task;
@@ -54,8 +53,9 @@ const processQueue = async () => {
                 ContentType: response.headers['content-type'] || 'video/x-matroska',
                 ContentDisposition: `attachment; filename="${fileName}"`
             },
+            // আপনার চাহিদা অনুযায়ী কনফিগারেশন 
             queueSize: 3, 
-            partSize: 1024 * 1024 * 10 // 10MB parts
+            partSize: 1024 * 1024 * 10 // 10MB parts 
         });
 
         await upload.done();
@@ -65,7 +65,11 @@ const processQueue = async () => {
     } finally {
         runningUploads--;
         activeUploads.delete(fileId);
-        processQueue(); // একটি শেষ হলে পরেরটি শুরু করার জন্য কল করা
+        
+        // র‍্যাম রিলিজ হওয়ার জন্য সামান্য সময় (৩০০ মি.সে.) বিরতি 
+        setTimeout(() => {
+            processQueue();
+        }, 300);
     }
 };
 
@@ -77,7 +81,7 @@ app.get('/:fileId', async (req, res) => {
         let fileName = "";
         let fileSize = 0;
 
-        // ১. নাম উদ্ধার (আপনার পছন্দের Scraping Method সহ)
+        // ১. নাম উদ্ধার (API এবং Scraping Method) 
         try {
             const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size&key=${process.env.GDRIVE_API_KEY}`;
             const metaResponse = await axios.get(metaUrl);
@@ -88,21 +92,20 @@ app.get('/:fileId', async (req, res) => {
             try {
                 const previewUrl = `https://drive.google.com/file/d/${fileId}/view`;
                 const response = await axios.get(previewUrl, { 
-                    headers: { 'User-Agent': 'Mozilla/5.0' } 
+                    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' } 
                 });
                 const match = response.data.match(/<title>(.*?) - Google Drive<\/title>/);
                 if (match && match[1]) {
                     fileName = match[1].trim();
-                    console.log(`Found via Scraping: ${fileName}`);
                 }
             } catch (scrapErr) {
-                console.error(`Scraping method also failed for ${fileId}`);
+                console.error(`Scraping failed for ${fileId}`);
             }
         }
 
         const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
 
-        // ৩য় অপশন: নাম না পাওয়া গেলে Header চেক
+        // ২. বিকল্প Header চেক
         if (!fileName) {
             try {
                 const headRes = await axios.head(gDriveUrl);
@@ -118,7 +121,7 @@ app.get('/:fileId', async (req, res) => {
         const r2Key = fileName;
         const r2PublicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${encodeURIComponent(r2Key)}`;
 
-        // ২. R2 চেক
+        // ৩. R2 চেক 
         try {
             const headData = await s3Client.send(new HeadObjectCommand({
                 Bucket: process.env.R2_BUCKET_NAME,
@@ -133,23 +136,20 @@ app.get('/:fileId', async (req, res) => {
             });
         } catch (e) { /* ফাইল নেই */ }
 
-        // ৩. কিউতে যুক্ত করা (যদি অলরেডি না থাকে)
+        // ৪. কিউতে যুক্ত করা 
         if (!activeUploads.has(fileId)) {
             activeUploads.add(fileId);
             uploadQueue.push({ fileId, fileName, r2Key, gDriveUrl });
-            console.log(`[Queue] Added: ${fileName}. Queue position: ${uploadQueue.length}`);
-            processQueue(); // কিউ চেক করা
+            processQueue(); 
         }
 
-        // বর্তমান অবস্থা জানানো
         const queuePos = uploadQueue.findIndex(f => f.fileId === fileId) + 1;
         
         res.json({
             status: "processing",
             filename: fileName,
-            message: queuePos > 0 ? `In queue (Position: ${queuePos})` : "Uploading now...",
-            active_uploads: `${runningUploads}/${MAX_CONCURRENT_UPLOADS}`,
-            queue_length: uploadQueue.length
+            message: queuePos > 0 ? `In queue (Position: ${queuePos})` : "Uploading...",
+            active_slots: `${runningUploads}/${MAX_CONCURRENT_UPLOADS}`
         });
 
     } catch (error) {
@@ -158,6 +158,3 @@ app.get('/:fileId', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
-
-
