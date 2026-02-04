@@ -16,17 +16,24 @@ const s3Client = new S3Client({
     },
 });
 
-// --- কনকারেন্সি কন্ট্রোল ভেরিয়েবল ---
+// --- কনকারেন্সি এবং ট্র্যাকিং ভেরিয়েবল ---
 const MAX_CONCURRENT_UPLOADS = 5; 
 let runningUploads = 0;           
 const uploadQueue = [];           
 const activeUploads = new Set();  
+const failedFiles = new Set();    // চিরস্থায়ীভাবে ব্যর্থ (যেমন 404) ফাইল ট্র্যাকার
 
 app.get('/favicon.ico', (req, res) => res.status(204).end());
 
+// --- ১ ঘণ্টা পর পর ট্র্যাকার পরিষ্কার করার ফাংশন ---
+setInterval(() => {
+    console.log("[Cleaner] Clearing failed and active trackers to free memory...");
+    failedFiles.clear();
+    activeUploads.clear();
+}, 60 * 60 * 1000); 
+
 // --- কিউ প্রসেস করার ফাংশন ---
 const processQueue = async () => {
-    // স্লট খালি না থাকলে বা কিউ খালি থাকলে ফিরে যাবে
     if (runningUploads >= MAX_CONCURRENT_UPLOADS || uploadQueue.length === 0) {
         return;
     }
@@ -62,13 +69,17 @@ const processQueue = async () => {
         console.log(`[Success] Finished: ${fileName}`);
     } catch (err) {
         console.error(`[Error] Upload failed for ${fileName}:`, err.message);
-        // যদি ফেইল করে তবে সেট থেকে রিমুভ করে দিচ্ছি যাতে পরে আবার ট্রাই করা যায়
-        activeUploads.delete(fileId);
+        
+        // যদি ফাইলটি ড্রাইভে না থাকে (404), তবে লুপ ঠেকাতে ব্ল্যাকলিস্ট করা হবে
+        if (err.response && err.response.status === 404) {
+            console.log(`[Blacklist] Adding ${fileId} to failedFiles.`);
+            failedFiles.add(fileId);
+        } else {
+            // অন্য কোনো সাময়িক এরর হলে কিউ থেকে সরালাম যেন পরে আবার ট্রাই করা যায়
+            activeUploads.delete(fileId);
+        }
     } finally {
         runningUploads--;
-        // আপলোড শেষ হওয়ার পর সেট থেকে ফাইলটি রিমুভ করার প্রয়োজন নেই যদি আমরা চাই 
-        // যে এটি দ্বিতীয়বার প্রসেস না হোক। তবে মেমোরি পরিষ্কার রাখতে বা সাকসেস হলে রিমুভ করা ভালো।
-        
         setTimeout(() => {
             processQueue();
         }, 300);
@@ -78,6 +89,11 @@ const processQueue = async () => {
 app.get('/:fileId', async (req, res) => {
     const fileId = req.params.fileId;
     if (!fileId || fileId.length < 15) return res.status(400).json({ status: "error", message: "Invalid ID" });
+
+    // আগে ব্যর্থ হয়েছে এমন ফাইল হলে সরাসরি এরর
+    if (failedFiles.has(fileId)) {
+        return res.status(404).json({ status: "error", message: "File previously failed (404/Invalid)" });
+    }
 
     try {
         let fileName = "";
@@ -107,7 +123,7 @@ app.get('/:fileId', async (req, res) => {
 
         const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
 
-        // ২. বিকল্প Header চেক (যদি উপরের মেথডে নাম না পাওয়া যায়)
+        // ২. বিকল্প Header চেক
         if (!fileName) {
             try {
                 const headRes = await axios.head(gDriveUrl);
@@ -118,7 +134,6 @@ app.get('/:fileId', async (req, res) => {
             } catch (hErr) {}
         }
 
-        // একদমই নাম না পাওয়া গেলে আইডি ব্যবহার
         if (!fileName) fileName = `Movie_${fileId}.mkv`;
 
         const r2Key = fileName;
@@ -137,18 +152,16 @@ app.get('/:fileId', async (req, res) => {
                 size: headData.ContentLength || fileSize,
                 url: r2PublicUrl
             });
-        } catch (e) { /* ফাইল নেই, আপলোড দরকার */ }
+        } catch (e) { /* ফাইল নেই */ }
 
         // ৪. কিউতে যুক্ত করা (ডুপ্লিকেট চেক)
         if (!activeUploads.has(fileId)) {
             activeUploads.add(fileId);
             uploadQueue.push({ fileId, fileName, r2Key, gDriveUrl });
             console.log(`[Queue] Added: ${fileName}`);
-            // কিউ প্রসেসিং শুরু করা (যদি অলরেডি না চলে)
             processQueue(); 
         }
 
-        // কিউতে পজিশন বের করা
         const queuePos = uploadQueue.findIndex(f => f.fileId === fileId) + 1;
         
         res.json({
