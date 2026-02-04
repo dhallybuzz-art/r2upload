@@ -17,15 +17,16 @@ const s3Client = new S3Client({
 });
 
 // --- কনকারেন্সি কন্ট্রোল ভেরিয়েবল ---
-const MAX_CONCURRENT_UPLOADS = 5; // সর্বোচ্চ ৫টি ফাইল 
-let runningUploads = 0;           // বর্তমানে কতটি চলছে 
-const uploadQueue = [];           // অপেক্ষমান ফাইলের তালিকা 
-const activeUploads = new Set();  // একটি ফাইল আইডি একবারই প্রসেস করতে 
+const MAX_CONCURRENT_UPLOADS = 5; 
+let runningUploads = 0;           
+const uploadQueue = [];           
+const activeUploads = new Set();  
 
 app.get('/favicon.ico', (req, res) => res.status(204).end());
 
 // --- কিউ প্রসেস করার ফাংশন ---
 const processQueue = async () => {
+    // স্লট খালি না থাকলে বা কিউ খালি থাকলে ফিরে যাবে
     if (runningUploads >= MAX_CONCURRENT_UPLOADS || uploadQueue.length === 0) {
         return;
     }
@@ -53,20 +54,21 @@ const processQueue = async () => {
                 ContentType: response.headers['content-type'] || 'video/x-matroska',
                 ContentDisposition: `attachment; filename="${fileName}"`
             },
-            // আপনার চাহিদা অনুযায়ী কনফিগারেশন 
             queueSize: 3, 
-            partSize: 1024 * 1024 * 10 // 10MB parts 
+            partSize: 1024 * 1024 * 10 
         });
 
         await upload.done();
         console.log(`[Success] Finished: ${fileName}`);
     } catch (err) {
         console.error(`[Error] Upload failed for ${fileName}:`, err.message);
+        // যদি ফেইল করে তবে সেট থেকে রিমুভ করে দিচ্ছি যাতে পরে আবার ট্রাই করা যায়
+        activeUploads.delete(fileId);
     } finally {
         runningUploads--;
-        activeUploads.delete(fileId);
+        // আপলোড শেষ হওয়ার পর সেট থেকে ফাইলটি রিমুভ করার প্রয়োজন নেই যদি আমরা চাই 
+        // যে এটি দ্বিতীয়বার প্রসেস না হোক। তবে মেমোরি পরিষ্কার রাখতে বা সাকসেস হলে রিমুভ করা ভালো।
         
-        // র‍্যাম রিলিজ হওয়ার জন্য সামান্য সময় (৩০০ মি.সে.) বিরতি 
         setTimeout(() => {
             processQueue();
         }, 300);
@@ -105,7 +107,7 @@ app.get('/:fileId', async (req, res) => {
 
         const gDriveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GDRIVE_API_KEY}`;
 
-        // ২. বিকল্প Header চেক
+        // ২. বিকল্প Header চেক (যদি উপরের মেথডে নাম না পাওয়া যায়)
         if (!fileName) {
             try {
                 const headRes = await axios.head(gDriveUrl);
@@ -116,6 +118,7 @@ app.get('/:fileId', async (req, res) => {
             } catch (hErr) {}
         }
 
+        // একদমই নাম না পাওয়া গেলে আইডি ব্যবহার
         if (!fileName) fileName = `Movie_${fileId}.mkv`;
 
         const r2Key = fileName;
@@ -134,26 +137,30 @@ app.get('/:fileId', async (req, res) => {
                 size: headData.ContentLength || fileSize,
                 url: r2PublicUrl
             });
-        } catch (e) { /* ফাইল নেই */ }
+        } catch (e) { /* ফাইল নেই, আপলোড দরকার */ }
 
-        // ৪. কিউতে যুক্ত করা 
+        // ৪. কিউতে যুক্ত করা (ডুপ্লিকেট চেক)
         if (!activeUploads.has(fileId)) {
             activeUploads.add(fileId);
             uploadQueue.push({ fileId, fileName, r2Key, gDriveUrl });
+            console.log(`[Queue] Added: ${fileName}`);
+            // কিউ প্রসেসিং শুরু করা (যদি অলরেডি না চলে)
             processQueue(); 
         }
 
+        // কিউতে পজিশন বের করা
         const queuePos = uploadQueue.findIndex(f => f.fileId === fileId) + 1;
         
         res.json({
             status: "processing",
             filename: fileName,
             message: queuePos > 0 ? `In queue (Position: ${queuePos})` : "Uploading...",
-            active_slots: `${runningUploads}/${MAX_CONCURRENT_UPLOADS}`
+            active_slots: `${runningUploads}/${MAX_CONCURRENT_UPLOADS}`,
+            queue_length: uploadQueue.length
         });
 
     } catch (error) {
-        res.json({ status: "processing", message: "Initializing stream..." });
+        res.json({ status: "error", message: "Server encountered an error." });
     }
 });
 
